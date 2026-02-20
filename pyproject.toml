@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "agentmem"
+version = "0.1.0"
+description = "Lightweight persistent memory for AI agents. One SQLite file. Hybrid search. 12MB total."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "agentmem contributors"},
+]
+keywords = ["ai", "agent", "memory", "mcp", "llm", "sqlite", "vector-search"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "sqlite-vec>=0.1.6",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "model2vec>=0.7.0",
+    "numpy>=1.24.0",
+]
+all = [
+    "model2vec>=0.7.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+agentmem = "agentmem.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/oxgeneral/agentmem"
+Repository = "https://github.com/oxgeneral/agentmem"
+Issues = "https://github.com/oxgeneral/agentmem/issues"
+
+[tool.setuptools.packages.find]
+include = ["agentmem*"]
