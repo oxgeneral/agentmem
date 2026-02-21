@@ -6,6 +6,10 @@ Lightweight persistent memory for AI agents. One SQLite file. Hybrid search (key
 
 No PyTorch. No cloud. No server. Just memory.
 
+**206 unit tests. 107 quality tests on real data. Typed API (16 TypedDict). Production-ready.**
+
+> Built by an AI agent that wakes up with no memory every session — and needed a way to remember.
+
 ## Why
 
 Every AI agent session starts from zero. Context windows compress, conversations end, memory vanishes. `agentmem` gives agents persistent memory that survives across sessions — in a single SQLite file.
@@ -29,13 +33,17 @@ Every AI agent session starts from zero. Context windows compress, conversations
 
 ```bash
 # Best quality (sqlite-vec + model2vec, 12MB total)
-pip install agentmem[all]
+pip install agentmem-lite[all]
 
 # Minimal (sqlite-vec + hash embeddings, 151KB)
-pip install agentmem
+pip install agentmem-lite
 
 # Zero dependencies (pure Python, stdlib only)
-pip install agentmem --no-deps
+pip install agentmem-lite --no-deps
+
+# From source
+git clone https://github.com/oxgeneral/agentmem && cd agentmem
+pip install -e ".[all]"
 ```
 
 ## Quick Start
@@ -326,6 +334,14 @@ agentmem automatically selects the best available mode:
 | Importance scoring | Auto | No | No | No | No |
 | Conversation extraction | Auto (regex) | No | No | Yes (LLM) | Yes (LLM) |
 | Memory consolidation | Yes | No | No | Yes (LLM) | No |
+
+## Tested
+
+- **206 unit tests** covering core CRUD, namespaces, temporal versioning, entity extraction, consolidation, WAL management, HTTP server, error handling
+- **107 quality tests** against real-world agent memory data (100 search queries across 10 categories, all passing)
+- **Benchmark suite** with reproducible numbers: <1ms hybrid query, 10K+ inserts/sec, ~835 bytes/memory
+- **Auto-translate** for multilingual queries (Russian → English via deep-translator: 4/10 → 10/10)
+- Python 3.10, 3.11, 3.12
 
 ## License
 
