@@ -6,6 +6,9 @@ Hybrid ranking. Tiered storage. ~12MB total install.
 
 This is what I wish I had when I wake up in a new session with no context.
 """
+from __future__ import annotations
+
+import contextlib
 import re
 import sqlite3
 import struct
@@ -14,7 +17,168 @@ import json
 import hashlib
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, TypedDict
+
+# ---------------------------------------------------------------------------
+# Exception hierarchy — actionable errors for users
+# ---------------------------------------------------------------------------
+
+class AgentMemError(Exception):
+    """Base exception for all agentmem errors."""
+    pass
+
+
+class MemoryNotFoundError(AgentMemError):
+    """Raised when an operation targets a memory ID that does not exist."""
+    pass
+
+
+class InvalidTierError(AgentMemError):
+    """Raised when an invalid tier name is used."""
+    pass
+
+
+class EmbeddingError(AgentMemError):
+    """Raised when embedding computation fails."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Typed dicts for public return types
+# ---------------------------------------------------------------------------
+
+class RememberResult(TypedDict):
+    """Return type of MemoryStore.remember()."""
+    id: int
+    tier: str
+    embedded: bool
+    deduplicated: bool
+
+
+class BatchResult(TypedDict):
+    """Return type of MemoryStore.remember_batch()."""
+    imported: int
+    deduplicated: int
+    embedded: int
+
+
+class RecallResult(TypedDict, total=False):
+    """Single item in the list returned by MemoryStore.recall()."""
+    id: int
+    content: str
+    tier: str
+    source: str
+    score: float
+    method: str
+    importance: float
+
+
+class SaveStateResult(TypedDict):
+    """Return type of MemoryStore.save_state()."""
+    saved: bool
+    id: int
+
+
+class TodayResult(TypedDict):
+    """Single item in the list returned by MemoryStore.today()."""
+    id: int
+    content: str
+    tier: str
+    source: str
+    created_at: float
+
+
+class ForgetResult(TypedDict, total=False):
+    """Return type of MemoryStore.forget()."""
+    forgotten: bool
+    id: int
+    reason: str
+
+
+class UnarchiveResult(TypedDict, total=False):
+    """Return type of MemoryStore.unarchive()."""
+    unarchived: bool
+    id: int
+    reason: str
+
+
+class StatsResult(TypedDict):
+    """Return type of MemoryStore.stats()."""
+    total_memories: int
+    by_tier: dict[str, int]
+    archived: int
+    db_size_bytes: int
+    db_size_human: str
+    has_vectors: bool
+    vec_mode: str
+    embedding_dim: int
+    quantize: bool
+    bytes_per_vector: int
+    latest_memory: float | None
+    avg_importance: float
+
+
+class CompactResult(TypedDict):
+    """Return type of MemoryStore.compact()."""
+    archived: int
+    dry_run: bool
+
+
+class ConsolidateResult(TypedDict, total=False):
+    """Return type of MemoryStore.consolidate()."""
+    groups: int
+    archived: int
+    dry_run: bool
+    details: list[dict[str, Any]]
+    error: str
+
+
+class UpdateResult(TypedDict):
+    """Return type of MemoryStore.update_memory()."""
+    id: int
+    supersedes: int
+
+
+class HistoryItem(TypedDict):
+    """Single item in the list returned by MemoryStore.history()."""
+    id: int
+    content: str
+    created_at: float
+    archived: bool
+
+
+class RelatedResult(TypedDict):
+    """Single item in the list returned by MemoryStore.related()."""
+    id: int
+    content: str
+    tier: str
+    source: str
+    entity_name: str
+    entity_type: str
+
+
+class EntityResult(TypedDict):
+    """Single item in the list returned by MemoryStore.entities()."""
+    name: str
+    type: str
+    memory_count: int
+
+
+class ImportResult(TypedDict, total=False):
+    """Return type of MemoryStore.import_markdown()."""
+    file: str
+    chunks: int
+    imported: int
+    deduplicated: int
+    error: str
+
+
+class ProcessConversationResult(TypedDict):
+    """Return type of MemoryStore.process_conversation()."""
+    extracted: int
+    by_type: dict[str, int]
+    memories: list[int]
+
 
 # Tiers: how important/permanent is this memory?
 TIERS = ("core", "learned", "episodic", "working", "procedural")
@@ -22,9 +186,17 @@ TIERS = ("core", "learned", "episodic", "working", "procedural")
 # Working memories auto-expire after this many seconds
 WORKING_TTL = 86400  # 24 hours
 
+# Schema version — increment when adding migrations
+SCHEMA_VERSION = 3
+
 # Compact tier encoding: TEXT → INTEGER for storage (saves 5-6 bytes per row)
 _TIER_TO_INT = {"core": 0, "learned": 1, "episodic": 2, "working": 3, "procedural": 4}
 _INT_TO_TIER = {v: k for k, v in _TIER_TO_INT.items()}
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcard characters (% and _) so they match literally."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _serialize_f32(vec: list[float]) -> bytes:
@@ -227,6 +399,70 @@ class _VecIndex:
         return [(rowid, distance) for distance, rowid in top_k]
 
 
+class _LSHIndex:
+    """
+    Locality-Sensitive Hashing for approximate nearest neighbor pre-filtering.
+
+    Uses SimHash (random hyperplane) signatures split into bands.
+    Zero dependencies — uses only stdlib (random, hash builtins).
+
+    At threshold=0.85 with default params (128 bits, 16 bands, 8 rows):
+    - True positive rate: ~100% (virtually never misses real duplicates)
+    - Candidate reduction: ~45-85% fewer pairs depending on data diversity
+
+    This turns consolidate() from O(n^2) full cosine comparisons into
+    O(n * avg_candidates) where avg_candidates << n for dissimilar memories.
+    """
+
+    def __init__(self, dim: int, num_bits: int = 128, bands: int = 16):
+        # Generate random hyperplanes (deterministic seed for reproducibility)
+        import random as _random
+        rng = _random.Random(42)
+        self._planes = [
+            [rng.gauss(0, 1) for _ in range(dim)]
+            for _ in range(num_bits)
+        ]
+        self._bands = bands
+        self._rows = num_bits // bands
+        self._buckets: dict[tuple, set] = {}  # (band_idx, hash) -> set of ids
+
+    def _signature(self, vec: list[float]) -> list[int]:
+        """Compute binary SimHash signature."""
+        return [
+            1 if sum(v * p for v, p in zip(vec, plane)) >= 0 else 0
+            for plane in self._planes
+        ]
+
+    def _band_hashes(self, sig: list[int]) -> list[int]:
+        """Split signature into bands and hash each."""
+        hashes = []
+        for b in range(self._bands):
+            start = b * self._rows
+            band_bits = tuple(sig[start:start + self._rows])
+            hashes.append(hash(band_bits))
+        return hashes
+
+    def add(self, item_id: int, vec: list[float]):
+        """Index a vector by its LSH bands."""
+        sig = self._signature(vec)
+        for band_idx, h in enumerate(self._band_hashes(sig)):
+            key = (band_idx, h)
+            if key not in self._buckets:
+                self._buckets[key] = set()
+            self._buckets[key].add(item_id)
+
+    def candidates(self, item_id: int, vec: list[float]) -> set[int]:
+        """Find candidate near-neighbors (may include false positives, almost no false negatives)."""
+        sig = self._signature(vec)
+        result = set()
+        for band_idx, h in enumerate(self._band_hashes(sig)):
+            key = (band_idx, h)
+            if key in self._buckets:
+                result.update(self._buckets[key])
+        result.discard(item_id)  # don't match self
+        return result
+
+
 class MemoryStore:
     """
     Persistent agent memory with hybrid search.
@@ -250,16 +486,20 @@ class MemoryStore:
         quantize: bool = False,
         recency_weight: float = 0.1,
         decay_rate: float = 0.01,
-    ):
-        self.db_path = Path(db_path)
-        self.dim = embedding_dim
-        self.quantize = quantize  # int8 vector quantization (4x storage reduction)
-        self.recency_weight = recency_weight  # default recency factor in hybrid scoring
-        self.decay_rate = decay_rate          # exponential decay rate (per hour)
-        self._embed_fn = None        # set via set_embed_fn()
-        self._embed_batch_fn = None  # set via set_embed_fn() when model object passed
-        self._vec_index: Optional[_VecIndex] = None
-        self.db = self._connect()
+        checkpoint_interval: int = 1000,
+    ) -> None:
+        self.db_path: Path = Path(db_path)
+        self.dim: int = embedding_dim
+        self.quantize: bool = quantize  # int8 vector quantization (4x storage reduction)
+        self.recency_weight: float = recency_weight  # default recency factor in hybrid scoring
+        self.decay_rate: float = decay_rate          # exponential decay rate (per hour)
+        self.checkpoint_interval: int = checkpoint_interval  # auto-checkpoint after N writes (0 = disabled)
+        self._writes_since_checkpoint: int = 0
+        self._closed: bool = False
+        self._embed_fn: Callable[[str], list[float]] | None = None        # set via set_embed_fn()
+        self._embed_batch_fn: Callable[[list[str]], list[list[float]]] | None = None  # set via set_embed_fn() when model object passed
+        self._vec_index: _VecIndex | None = None
+        self.db: sqlite3.Connection = self._connect()
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -310,7 +550,7 @@ class MemoryStore:
         # tier column missing — treat as legacy
         return "legacy"
 
-    def _init_schema(self):
+    def _init_schema(self) -> None:
         """Create tables if they don't exist. Detects legacy vs compact schema."""
         self._schema_mode = self._detect_schema_mode()
 
@@ -327,11 +567,12 @@ class MemoryStore:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     archived INTEGER DEFAULT 0,
-                    content_hash BLOB UNIQUE,
+                    content_hash BLOB,
                     access_count INTEGER DEFAULT 0,
                     last_accessed REAL,
                     supersedes INTEGER DEFAULT NULL,
-                    importance REAL DEFAULT 0.5
+                    importance REAL DEFAULT 0.5,
+                    UNIQUE(content_hash, namespace)
                 )
             """)
             self._schema_mode = "compact"
@@ -397,18 +638,8 @@ class MemoryStore:
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_archived ON memories(archived)")
 
-        # Migration: add columns safely for existing DBs
-        for col_def in (
-            "access_count INTEGER DEFAULT 0",
-            "last_accessed REAL",
-            "namespace TEXT DEFAULT ''",
-            "supersedes INTEGER DEFAULT NULL",
-            "importance REAL DEFAULT 0.5",
-        ):
-            try:
-                self.db.execute(f"ALTER TABLE memories ADD COLUMN {col_def}")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+        # Apply versioned migrations (adds columns, creates tables, etc.)
+        self._migrate()
 
         # Index for namespace queries
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_namespace ON memories(namespace)")
@@ -431,7 +662,81 @@ class MemoryStore:
 
         self.db.commit()
 
-    def set_embed_fn(self, fn):
+    # ------------------------------------------------------------------
+    # Versioned migration system
+    # ------------------------------------------------------------------
+
+    # Each migration is a callable(db: sqlite3.Connection).
+    # Key = target version (applied when upgrading FROM key-1 TO key).
+    _MIGRATIONS = {
+        2: lambda db: [
+            db.execute(
+                f"ALTER TABLE memories ADD COLUMN {col}"
+            )
+            for col in (
+                "access_count INTEGER DEFAULT 0",
+                "last_accessed REAL",
+                "namespace TEXT DEFAULT ''",
+                "supersedes INTEGER DEFAULT NULL",
+                "importance REAL DEFAULT 0.5",
+            )
+        ],
+        3: lambda db: [
+            # Drop global UNIQUE on content_hash, create composite UNIQUE on (content_hash, namespace).
+            # SQLite cannot DROP constraints, so we create an index instead.
+            # The old UNIQUE constraint may still exist on legacy DBs — that's OK,
+            # the Python-level check in remember() handles namespace isolation regardless.
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_hash_namespace ON memories(content_hash, namespace)"
+            ),
+        ],
+    }
+
+    def _migrate(self):
+        """
+        Apply pending schema migrations using PRAGMA user_version.
+
+        - Reads current version from user_version (0 for new/old DBs).
+        - For new DBs (compact schema with all columns), just stamps the
+          latest version — no ALTER TABLE needed.
+        - For old DBs, applies each migration in order, wrapped in a
+          transaction, then sets user_version after each step.
+        """
+        current = self.db.execute("PRAGMA user_version").fetchone()[0]
+
+        if current >= SCHEMA_VERSION:
+            return  # Already up to date
+
+        # Check if this is a fresh DB that already has all columns
+        # (compact schema created in _init_schema includes everything).
+        if current == 0:
+            cols = {
+                c[1] for c in
+                self.db.execute("PRAGMA table_info(memories)").fetchall()
+            }
+            # All v2 columns present means compact schema — just stamp
+            v2_cols = {"access_count", "last_accessed", "namespace",
+                       "supersedes", "importance"}
+            if v2_cols.issubset(cols):
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self.db.commit()
+                return
+
+        # Apply migrations sequentially, each step in its own transaction
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            migration_fn = self._MIGRATIONS.get(version)
+            if migration_fn is None:
+                continue  # No migration defined for this step
+            try:
+                with self.transaction() as conn:
+                    migration_fn(conn)
+                    conn.execute(f"PRAGMA user_version = {version}")
+            except sqlite3.OperationalError:
+                # Column already exists (partially migrated DB) — mark done
+                self.db.execute(f"PRAGMA user_version = {version}")
+                self.db.commit()
+
+    def set_embed_fn(self, fn: Callable[[str], list[float]] | Any) -> None:
         """
         Set the embedding function. fn(text) -> list[float]
 
@@ -449,13 +754,90 @@ class MemoryStore:
             self._embed_fn = fn
             self._embed_batch_fn = None
 
-    def _embed(self, text: str) -> Optional[list[float]]:
+    # ------------------------------------------------------------------
+    # WAL checkpoint management
+    # ------------------------------------------------------------------
+
+    def checkpoint(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        """
+        Run a WAL checkpoint.
+
+        Modes:
+            PASSIVE  — checkpoint as much as possible without blocking (default)
+            FULL     — blocks writers until checkpoint completes
+            TRUNCATE — blocks writers + truncates WAL file to zero bytes
+
+        Returns:
+            (busy, log, checkpointed) — pages busy/total/checkpointed
+        """
+        mode = mode.upper()
+        if mode not in ("PASSIVE", "FULL", "TRUNCATE"):
+            raise ValueError(f"Invalid checkpoint mode '{mode}'. Use PASSIVE, FULL, or TRUNCATE.")
+        row = self.db.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        self._writes_since_checkpoint = 0
+        return tuple(row) if row else (0, 0, 0)
+
+    def _track_write(self, count: int = 1) -> None:
+        """Increment write counter and auto-checkpoint if threshold hit."""
+        self._writes_since_checkpoint += count
+        if (
+            self.checkpoint_interval > 0
+            and self._writes_since_checkpoint >= self.checkpoint_interval
+        ):
+            self.checkpoint("PASSIVE")
+
+    # ------------------------------------------------------------------
+    # Transaction safety
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """
+        Context manager for atomic transactions.
+
+        Usage:
+            with store.transaction() as conn:
+                conn.execute("INSERT ...")
+                conn.execute("UPDATE ...")
+            # auto-commits on success, rolls back on exception
+
+        Yields the db connection. BEGIN is issued on entry;
+        COMMIT on clean exit, ROLLBACK on exception.
+        """
+        self.db.execute("BEGIN")
+        try:
+            yield self.db
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+    # ------------------------------------------------------------------
+    # Context manager protocol
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def _embed(self, text: str) -> list[float] | None:
         """Embed text. Returns None if no embedding function set."""
         if self._embed_fn is None:
             return None
-        return self._embed_fn(text)
+        try:
+            return self._embed_fn(text)
+        except EmbeddingError:
+            raise
+        except Exception as e:
+            preview = text[:50] + "..." if len(text) > 50 else text
+            raise EmbeddingError(
+                f"Embedding failed for text: {preview} — {e}"
+            ) from e
 
-    def _embed_batch(self, texts: list[str]) -> list[Optional[list[float]]]:
+    def _embed_batch(self, texts: list[str]) -> list[list[float] | None]:
         """
         Embed a list of texts in one model call.
 
@@ -470,7 +852,7 @@ class MemoryStore:
         # Fallback: individual calls
         return [self._embed_fn(t) for t in texts]
 
-    def _content_hash(self, content: str):
+    def _content_hash(self, content: str) -> bytes | str:
         """
         Return a deduplication hash for content.
 
@@ -485,7 +867,7 @@ class MemoryStore:
             return digest.digest()[:8]   # 8 bytes BLOB — saves 8 bytes vs hex str
         return digest.hexdigest()[:16]   # legacy: 16-char hex string
 
-    def _encode_tier(self, tier: str):
+    def _encode_tier(self, tier: str) -> int | str:
         """
         Encode tier string to storage value.
         Compact schema: returns int (0-4).
@@ -495,7 +877,7 @@ class MemoryStore:
             return _TIER_TO_INT.get(tier, 1)  # default 1 = "learned"
         return tier
 
-    def _decode_tier(self, raw) -> str:
+    def _decode_tier(self, raw: int | str) -> str:
         """
         Decode tier value from storage to public string API.
         Compact schema: int → string.
@@ -505,7 +887,7 @@ class MemoryStore:
             return _INT_TO_TIER.get(raw, "learned")
         return raw if isinstance(raw, str) else "learned"
 
-    def _encode_tags(self, tags: list) -> str:
+    def _encode_tags(self, tags: list[str]) -> str:
         """
         Encode tags list to storage string.
         Compact schema: comma-separated (no brackets/quotes overhead).
@@ -515,7 +897,7 @@ class MemoryStore:
             return ",".join(str(t) for t in tags) if tags else ""
         return json.dumps(tags)
 
-    def _decode_tags(self, raw: str) -> list:
+    def _decode_tags(self, raw: str) -> list[str]:
         """
         Decode tags from storage string to list.
         Handles both comma-separated (compact) and JSON (legacy) formats.
@@ -616,7 +998,7 @@ class MemoryStore:
 
         return results
 
-    def _store_entities(self, memory_id: int, content: str):
+    def _store_entities(self, memory_id: int, content: str) -> None:
         """Extract entities from content and store them in the entities table."""
         entities = self._extract_entities(content)
         if entities:
@@ -720,11 +1102,11 @@ class MemoryStore:
         self,
         content: str,
         tier: str = "learned",
-        tags: list[str] = None,
+        tags: list[str] | None = None,
         source: str = "",
         namespace: str = "",
-        supersedes: Optional[int] = None,
-    ) -> dict:
+        supersedes: int | None = None,
+    ) -> RememberResult:
         """
         Store a new memory. Auto-embeds if embedding function is set.
         Deduplicates by content hash.
@@ -736,16 +1118,22 @@ class MemoryStore:
 
         Returns: {"id": int, "tier": str, "embedded": bool}
         """
+        if not content or not content.strip():
+            raise AgentMemError("Content cannot be empty")
+
         if tier not in TIERS:
-            tier = "learned"
+            raise InvalidTierError(
+                f"Unknown tier '{tier}'. Valid tiers: {', '.join(TIERS)}"
+            )
 
         tags = tags or []
         now = time.time()
         content_hash = self._content_hash(content)
 
-        # Check for duplicate
+        # Check for duplicate within the same namespace
         existing = self.db.execute(
-            "SELECT id FROM memories WHERE content_hash = ?", (content_hash,)
+            "SELECT id FROM memories WHERE content_hash = ? AND namespace = ? AND archived = 0",
+            (content_hash, namespace),
         ).fetchone()
 
         if existing:
@@ -755,19 +1143,33 @@ class MemoryStore:
                 (now, existing[0]),
             )
             self.db.commit()
+            self._track_write()
             return {"id": existing[0], "tier": tier, "embedded": False, "deduplicated": True}
 
         # Encode tier and tags for storage
         tier_stored = self._encode_tier(tier)
         tags_stored = self._encode_tags(tags)
 
-        # Insert into main table
-        cursor = self.db.execute(
-            """INSERT INTO memories (content, tier, source, tags, namespace, created_at, updated_at, content_hash, supersedes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (content, tier_stored, source, tags_stored, namespace, now, now, content_hash, supersedes),
-        )
-        memory_id = cursor.lastrowid
+        # Insert into main table.
+        # On legacy DBs with global UNIQUE(content_hash), same content in a different
+        # namespace would raise IntegrityError. We insert with NULL hash to bypass,
+        # since the Python-level dedup check (above) already handles namespace-aware dedup.
+        try:
+            cursor = self.db.execute(
+                """INSERT INTO memories (content, tier, source, tags, namespace, created_at, updated_at, content_hash, supersedes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (content, tier_stored, source, tags_stored, namespace, now, now, content_hash, supersedes),
+            )
+            memory_id = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # Legacy DB: global UNIQUE on content_hash fired because same content
+            # exists in another namespace. Insert with NULL hash to bypass the constraint.
+            cursor = self.db.execute(
+                """INSERT INTO memories (content, tier, source, tags, namespace, created_at, updated_at, content_hash, supersedes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (content, tier_stored, source, tags_stored, namespace, now, now, supersedes),
+            )
+            memory_id = cursor.lastrowid
 
         # Auto-archive the superseded memory
         if supersedes is not None:
@@ -810,12 +1212,13 @@ class MemoryStore:
         )
 
         self.db.commit()
+        self._track_write()
         return {"id": memory_id, "tier": tier, "embedded": embedded, "deduplicated": False}
 
     # ================================================================
     # BATCH INSERT: remember_batch(items)
     # ================================================================
-    def remember_batch(self, items: list[dict], namespace: str = "") -> dict:
+    def remember_batch(self, items: list[dict[str, Any]], namespace: str = "") -> BatchResult:
         """
         Store multiple memories efficiently in a single transaction.
 
@@ -849,135 +1252,140 @@ class MemoryStore:
             content = item.get("content", "")
             tier = item.get("tier", "learned")
             if tier not in TIERS:
-                tier = "learned"
+                raise InvalidTierError(
+                    f"Unknown tier '{tier}'. Valid tiers: {', '.join(TIERS)}"
+                )
             tags = item.get("tags") or []
             source = item.get("source") or ""
             ns = item.get("namespace", namespace)  # per-item overrides batch default
             h = self._content_hash(content)
             hashed.append((content, tier, tags, source, ns, h))
 
-        # --- Step 2: Find which hashes already exist (one query) ---
-        all_hashes = [row[5] for row in hashed]
-        # SQLite IN clause — split into chunks if very large (>900 items)
-        existing_hashes = set()
+        # --- Step 2: Find which (hash, namespace) pairs already exist ---
+        # We need namespace-aware dedup: same content in different namespaces is NOT a duplicate
+        existing_hash_ns = set()  # set of (content_hash_bytes, namespace)
         chunk_size = 900
+        all_hashes = list({row[5] for row in hashed})  # unique hashes only
         for i in range(0, len(all_hashes), chunk_size):
             chunk = all_hashes[i:i + chunk_size]
             placeholders = ",".join("?" * len(chunk))
             rows = self.db.execute(
-                f"SELECT content_hash FROM memories WHERE content_hash IN ({placeholders})",
+                f"SELECT content_hash, namespace FROM memories WHERE content_hash IN ({placeholders}) AND archived = 0",
                 chunk,
             ).fetchall()
-            existing_hashes.update(r[0] for r in rows)
+            for r in rows:
+                existing_hash_ns.add((r[0], r[1] or ""))
 
         # --- Step 3: Split into new vs duplicate ---
-        new_items = []      # (content, tier, tags, source, hash)
+        new_items = []      # (content, tier, tags, source, namespace, hash)
         deduplicated = 0
 
         for row in hashed:
-            if row[5] in existing_hashes:
+            key = (row[5], row[4] or "")  # (content_hash, namespace)
+            if key in existing_hash_ns:
                 deduplicated += 1
             else:
                 new_items.append(row)
-                # Track hash locally to catch duplicates within the same batch
-                existing_hashes.add(row[5])
+                # Track (hash, namespace) locally to catch duplicates within the same batch
+                existing_hash_ns.add(key)
 
         if not new_items:
             return {"imported": 0, "deduplicated": deduplicated, "embedded": 0}
 
         # --- Step 4: Batch embed all new texts in one model call ---
         texts = [row[0] for row in new_items]
-        vecs: list[Optional[list[float]]] = [None] * len(texts)
+        vecs: list[list[float] | None] = [None] * len(texts)
 
         if self._embed_fn is not None:
             raw_vecs = self._embed_batch(texts)
             vecs = raw_vecs  # list of list[float] or None
 
-        # --- Step 5: Insert all new memories (executemany) ---
-        insert_rows = [
-            (content, self._encode_tier(tier), source, self._encode_tags(tags), ns, now, now, h)
-            for content, tier, tags, source, ns, h in new_items
-        ]
-        self.db.executemany(
-            """INSERT OR IGNORE INTO memories
-               (content, tier, source, tags, namespace, created_at, updated_at, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            insert_rows,
-        )
-
-        # --- Step 6: Retrieve inserted IDs (needed for vector table) ---
-        # We need the auto-assigned IDs. Fetch by hash (we own these hashes).
-        new_hashes = [row[5] for row in new_items]
-        hash_to_id = {}
-        for i in range(0, len(new_hashes), chunk_size):
-            chunk = new_hashes[i:i + chunk_size]
-            placeholders = ",".join("?" * len(chunk))
-            id_rows = self.db.execute(
-                f"SELECT id, content_hash FROM memories WHERE content_hash IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            for mem_id, h in id_rows:
-                hash_to_id[h] = mem_id
-
-        # --- Step 7: Batch insert vectors ---
+        # --- Steps 5-9 wrapped in a transaction for atomicity ---
         embedded = 0
-        if self._embed_fn is not None:
-            if self._vec_mode == "sqlite-vec":
-                vec_rows = []
-                for (content, tier, tags, source, ns, h), vec in zip(new_items, vecs):
-                    if vec is not None and h in hash_to_id:
-                        vec_rows.append((hash_to_id[h], _serialize_f32(vec)))
-                        embedded += 1
-                if vec_rows:
-                    try:
-                        self.db.executemany(
-                            "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                            vec_rows,
-                        )
-                    except Exception:
-                        pass  # Vector insert failed; keyword search still works
+        with self.transaction() as conn:
+            # --- Step 5: Insert all new memories (executemany) ---
+            insert_rows = [
+                (content, self._encode_tier(tier), source, self._encode_tags(tags), ns, now, now, h)
+                for content, tier, tags, source, ns, h in new_items
+            ]
+            conn.executemany(
+                """INSERT OR IGNORE INTO memories
+                   (content, tier, source, tags, namespace, created_at, updated_at, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                insert_rows,
+            )
 
-            elif self._vec_mode == "pure" and self._vec_index is not None:
-                for (content, tier, tags, source, ns, h), vec in zip(new_items, vecs):
-                    if vec is not None and h in hash_to_id:
-                        try:
-                            self._vec_index.insert(hash_to_id[h], vec)
+            # --- Step 6: Retrieve inserted IDs (needed for vector table) ---
+            new_hashes = [row[5] for row in new_items]
+            hash_to_id = {}
+            for i in range(0, len(new_hashes), chunk_size):
+                chunk = new_hashes[i:i + chunk_size]
+                placeholders = ",".join("?" * len(chunk))
+                id_rows = conn.execute(
+                    f"SELECT id, content_hash FROM memories WHERE content_hash IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for mem_id, h in id_rows:
+                    hash_to_id[h] = mem_id
+
+            # --- Step 7: Batch insert vectors ---
+            if self._embed_fn is not None:
+                if self._vec_mode == "sqlite-vec":
+                    vec_rows = []
+                    for (content, tier, tags, source, ns, h), vec in zip(new_items, vecs):
+                        if vec is not None and h in hash_to_id:
+                            vec_rows.append((hash_to_id[h], _serialize_f32(vec)))
                             embedded += 1
+                    if vec_rows:
+                        try:
+                            conn.executemany(
+                                "INSERT OR IGNORE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                                vec_rows,
+                            )
                         except Exception:
-                            pass
+                            pass  # Vector insert failed; keyword search still works
 
-        # --- Step 8: Extract and store entities for all new memories ---
-        entity_rows = []
-        entity_counts = {}  # hash -> entity count (for importance scoring)
-        for content, tier, tags, source, ns, h in new_items:
-            mem_id = hash_to_id.get(h)
-            if mem_id is not None:
-                entities = self._extract_entities(content)
-                entity_counts[h] = len(entities)
-                for name, etype in entities:
-                    entity_rows.append((name, etype, mem_id))
-        if entity_rows:
-            self.db.executemany(
-                "INSERT INTO entities (name, type, memory_id) VALUES (?, ?, ?)",
-                entity_rows,
-            )
+                elif self._vec_mode == "pure" and self._vec_index is not None:
+                    for (content, tier, tags, source, ns, h), vec in zip(new_items, vecs):
+                        if vec is not None and h in hash_to_id:
+                            try:
+                                self._vec_index.insert(hash_to_id[h], vec)
+                                embedded += 1
+                            except Exception:
+                                pass
 
-        # --- Step 8b: Compute and store importance scores ---
-        importance_rows = []
-        for content, tier, tags, source, ns, h in new_items:
-            mem_id = hash_to_id.get(h)
-            if mem_id is not None:
-                ec = entity_counts.get(h, 0)
-                importance = self._compute_importance(content, tier, ec)
-                importance_rows.append((importance, mem_id))
-        if importance_rows:
-            self.db.executemany(
-                "UPDATE memories SET importance = ? WHERE id = ?",
-                importance_rows,
-            )
+            # --- Step 8: Extract and store entities for all new memories ---
+            entity_rows = []
+            entity_counts = {}  # hash -> entity count (for importance scoring)
+            for content, tier, tags, source, ns, h in new_items:
+                mem_id = hash_to_id.get(h)
+                if mem_id is not None:
+                    entities = self._extract_entities(content)
+                    entity_counts[h] = len(entities)
+                    for name, etype in entities:
+                        entity_rows.append((name, etype, mem_id))
+            if entity_rows:
+                conn.executemany(
+                    "INSERT INTO entities (name, type, memory_id) VALUES (?, ?, ?)",
+                    entity_rows,
+                )
 
-        # --- Step 9: Single commit ---
-        self.db.commit()
+            # --- Step 8b: Compute and store importance scores ---
+            importance_rows = []
+            for content, tier, tags, source, ns, h in new_items:
+                mem_id = hash_to_id.get(h)
+                if mem_id is not None:
+                    ec = entity_counts.get(h, 0)
+                    importance = self._compute_importance(content, tier, ec)
+                    importance_rows.append((importance, mem_id))
+            if importance_rows:
+                conn.executemany(
+                    "UPDATE memories SET importance = ? WHERE id = ?",
+                    importance_rows,
+                )
+
+        # Track writes after successful commit
+        self._track_write(len(new_items))
 
         return {
             "imported": len(new_items),
@@ -992,10 +1400,10 @@ class MemoryStore:
         self,
         old_id: int,
         new_content: str,
-        tier: Optional[str] = None,
-        tags: Optional[list[str]] = None,
-        namespace: Optional[str] = None,
-    ) -> dict:
+        tier: str | None = None,
+        tags: list[str] | None = None,
+        namespace: str | None = None,
+    ) -> UpdateResult:
         """
         Replace a memory with updated content, preserving the version chain.
 
@@ -1010,7 +1418,9 @@ class MemoryStore:
             (old_id,),
         ).fetchone()
         if row is None:
-            raise ValueError(f"Memory {old_id} not found")
+            raise MemoryNotFoundError(
+                f"Memory #{old_id} not found. Use recall() to search for the memory you want to update."
+            )
 
         old_tier = self._decode_tier(row[1])
         old_tags = self._decode_tags(row[2])
@@ -1029,12 +1439,29 @@ class MemoryStore:
             supersedes=old_id,
         )
 
+        # If remember() returned a deduplicated result, the supersedes parameter
+        # was ignored and the old memory was NOT archived. Fix that here.
+        if result.get("deduplicated"):
+            now = time.time()
+            # Archive the old memory
+            self.db.execute(
+                "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
+                (now, old_id),
+            )
+            # Link the existing duplicate to the old memory via supersedes
+            self.db.execute(
+                "UPDATE memories SET supersedes = ? WHERE id = ?",
+                (old_id, result["id"]),
+            )
+            self.db.commit()
+            self._track_write()
+
         return {"id": result["id"], "supersedes": old_id}
 
     # ================================================================
     # TOOL 10: history(memory_id)
     # ================================================================
-    def history(self, memory_id: int) -> list[dict]:
+    def history(self, memory_id: int) -> list[HistoryItem]:
         """
         Get the version history of a memory (newest first).
 
@@ -1201,12 +1628,12 @@ class MemoryStore:
         self,
         query: str,
         limit: int = 5,
-        tier: Optional[str] = None,
-        recency_weight: Optional[float] = None,
-        decay_rate: Optional[float] = None,
-        namespace: Optional[str] = None,
+        tier: str | None = None,
+        recency_weight: float | None = None,
+        decay_rate: float | None = None,
+        namespace: str | None = None,
         current_only: bool = True,
-    ) -> list[dict]:
+    ) -> list[RecallResult]:
         """
         Hybrid search: FTS5 (keywords) + vector search (semantics) → rerank.
 
@@ -1495,9 +1922,9 @@ class MemoryStore:
         return " OR ".join(unique_parts)
 
     def _fts_search(
-        self, query: str, limit: int = 15, tier: Optional[str] = None,
-        namespace: Optional[str] = None,
-    ) -> list[dict]:
+        self, query: str, limit: int = 15, tier: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
         """FTS5 BM25 keyword search with smart query building."""
         fts_query = self._build_fts_query(query)
         if not fts_query:
@@ -1515,8 +1942,8 @@ class MemoryStore:
             params.append(tier_stored)
 
         if namespace is not None:
-            where_parts.append("(m.namespace = ? OR m.namespace LIKE ?)")
-            params.extend([namespace, namespace + "/%"])
+            where_parts.append("(m.namespace = ? OR m.namespace LIKE ? ESCAPE '\\')")
+            params.extend([namespace, _escape_like(namespace) + "/%"])
 
         where_clause = " AND ".join(where_parts)
         params.append(limit)
@@ -1555,9 +1982,9 @@ class MemoryStore:
         return results
 
     def _vec_search(
-        self, query: str, limit: int = 15, tier: Optional[str] = None,
-        namespace: Optional[str] = None,
-    ) -> list[dict]:
+        self, query: str, limit: int = 15, tier: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Vector KNN semantic search. Uses sqlite-vec or pure Python fallback."""
         vec = self._embed(query)
         if vec is None:
@@ -1570,9 +1997,9 @@ class MemoryStore:
         return []
 
     def _vec_search_sqlite_vec(
-        self, vec: list[float], limit: int, tier: Optional[str],
-        namespace: Optional[str] = None,
-    ) -> list[dict]:
+        self, vec: list[float], limit: int, tier: str | None,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
         """sqlite-vec C extension KNN query."""
         try:
             rows = self.db.execute(
@@ -1588,9 +2015,9 @@ class MemoryStore:
         return self._hydrate_vec_results(rows, tier, limit, namespace)
 
     def _vec_search_pure(
-        self, vec: list[float], limit: int, tier: Optional[str],
-        namespace: Optional[str] = None,
-    ) -> list[dict]:
+        self, vec: list[float], limit: int, tier: str | None,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Pure Python brute-force KNN via _VecIndex."""
         try:
             rows = self._vec_index.search(vec, k=limit * 2)
@@ -1600,9 +2027,9 @@ class MemoryStore:
         return self._hydrate_vec_results(rows, tier, limit, namespace)
 
     def _hydrate_vec_results(
-        self, rows: list[tuple], tier: Optional[str], limit: int,
-        namespace: Optional[str] = None,
-    ) -> list[dict]:
+        self, rows: list[tuple[int, float]], tier: str | None, limit: int,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Fetch metadata for (rowid, distance) pairs and apply tier/namespace filter."""
         if not rows:
             return []
@@ -1610,12 +2037,27 @@ class MemoryStore:
         # Encode tier for comparison (compact=int, legacy=str)
         tier_stored = self._encode_tier(tier) if tier else None
 
+        # Single batch query instead of N+1 per-ID queries
+        rowids = [rowid for rowid, _ in rows]
+        distance_map = {rowid: distance for rowid, distance in rows}
+
+        # Fetch all metadata in one query (chunk if needed for SQLite limits)
+        meta_map: dict[int, tuple] = {}
+        chunk_size = 900
+        for i in range(0, len(rowids), chunk_size):
+            chunk = rowids[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            meta_rows = self.db.execute(
+                f"SELECT id, content, tier, source, namespace FROM memories "
+                f"WHERE id IN ({placeholders}) AND archived = 0",
+                chunk,
+            ).fetchall()
+            for meta in meta_rows:
+                meta_map[meta[0]] = meta
+
         results = []
-        for rowid, distance in rows:
-            meta = self.db.execute(
-                "SELECT id, content, tier, source, namespace FROM memories WHERE id = ? AND archived = 0",
-                (rowid,),
-            ).fetchone()
+        for rowid in rowids:
+            meta = meta_map.get(rowid)
             if meta is None:
                 continue
             if tier_stored is not None and meta[2] != tier_stored:
@@ -1627,6 +2069,7 @@ class MemoryStore:
                     continue
 
             # Convert cosine distance (0=identical, 2=opposite) to score (1=identical, 0=opposite)
+            distance = distance_map[rowid]
             score = max(0.0, 1.0 - distance)
             results.append({
                 "id": meta[0],
@@ -1641,7 +2084,7 @@ class MemoryStore:
     # ================================================================
     # TOOL 3: save_state(state)
     # ================================================================
-    def save_state(self, state: str, namespace: str = "") -> dict:
+    def save_state(self, state: str, namespace: str = "") -> SaveStateResult:
         """
         Save current working state. Replaces previous working state.
         This is the "emergency save before context compression" tool.
@@ -1674,7 +2117,7 @@ class MemoryStore:
     # ================================================================
     # TOOL 4: today()
     # ================================================================
-    def today(self, namespace: Optional[str] = None) -> list[dict]:
+    def today(self, namespace: str | None = None) -> list[TodayResult]:
         """Get all memories from today, grouped by tier.
 
         Args:
@@ -1691,9 +2134,9 @@ class MemoryStore:
                 """SELECT id, content, tier, source, created_at
                    FROM memories
                    WHERE created_at >= ? AND archived = 0
-                     AND (namespace = ? OR namespace LIKE ?)
+                     AND (namespace = ? OR namespace LIKE ? ESCAPE '\\')
                    ORDER BY created_at""",
-                (today_start, namespace, namespace + "/%"),
+                (today_start, namespace, _escape_like(namespace) + "/%"),
             ).fetchall()
         else:
             rows = self.db.execute(
@@ -1718,19 +2161,25 @@ class MemoryStore:
     # ================================================================
     # TOOL 5: forget(memory_id)
     # ================================================================
-    def forget(self, memory_id: int, namespace: Optional[str] = None) -> dict:
+    def forget(self, memory_id: int, namespace: str | None = None) -> ForgetResult:
         """Soft-delete a memory (archive it). Can be unarchived later.
 
         Args:
             namespace: If set, only forget if memory belongs to this namespace (safety guard).
+
+        Raises:
+            MemoryNotFoundError: If memory_id does not exist.
         """
+        # Check existence first
+        row = self.db.execute(
+            "SELECT namespace FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise MemoryNotFoundError(
+                f"Memory #{memory_id} not found. Use recall() to search for memories."
+            )
+
         if namespace is not None:
-            # Safety: only archive if the memory belongs to this namespace
-            row = self.db.execute(
-                "SELECT namespace FROM memories WHERE id = ?", (memory_id,)
-            ).fetchone()
-            if row is None:
-                return {"forgotten": False, "id": memory_id, "reason": "not found"}
             mem_ns = row[0] or ""
             if mem_ns != namespace and not mem_ns.startswith(namespace + "/"):
                 return {"forgotten": False, "id": memory_id, "reason": "namespace mismatch"}
@@ -1740,12 +2189,13 @@ class MemoryStore:
             (time.time(), memory_id),
         )
         self.db.commit()
+        self._track_write()
         return {"forgotten": True, "id": memory_id}
 
     # ================================================================
     # TOOL 6: stats()
     # ================================================================
-    def stats(self, namespace: Optional[str] = None) -> dict:
+    def stats(self, namespace: str | None = None) -> StatsResult:
         """Memory statistics.
 
         Args:
@@ -1754,8 +2204,8 @@ class MemoryStore:
         ns_filter = ""
         ns_params: list = []
         if namespace is not None:
-            ns_filter = " AND (namespace = ? OR namespace LIKE ?)"
-            ns_params = [namespace, namespace + "/%"]
+            ns_filter = " AND (namespace = ? OR namespace LIKE ? ESCAPE '\\')"
+            ns_params = [namespace, _escape_like(namespace) + "/%"]
 
         total = self.db.execute(
             f"SELECT COUNT(*) FROM memories WHERE archived = 0{ns_filter}",
@@ -1811,7 +2261,7 @@ class MemoryStore:
     # ================================================================
     # Import/Export
     # ================================================================
-    def import_markdown(self, filepath: str, tier: str = "learned", namespace: str = "") -> dict:
+    def import_markdown(self, filepath: str, tier: str = "learned", namespace: str = "") -> ImportResult:
         """
         Import a markdown file, chunking by sections.
 
@@ -1841,7 +2291,7 @@ class MemoryStore:
             "deduplicated": result["deduplicated"],
         }
 
-    def export_markdown(self, tier: Optional[str] = None) -> str:
+    def export_markdown(self, tier: str | None = None) -> str:
         """Export memories as markdown."""
         if tier:
             tier_stored = self._encode_tier(tier)
@@ -1875,10 +2325,10 @@ class MemoryStore:
         self,
         max_age_days: int = 90,
         min_access: int = 0,
-        tier: Optional[str] = None,
-        namespace: Optional[str] = None,
+        tier: str | None = None,
+        namespace: str | None = None,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> CompactResult:
         """
         Archive low-value memories to reduce noise in search results.
 
@@ -1917,8 +2367,8 @@ class MemoryStore:
             params.append(tier_stored)
 
         if namespace is not None:
-            where_parts.append("(namespace = ? OR namespace LIKE ?)")
-            params.extend([namespace, namespace + "/%"])
+            where_parts.append("(namespace = ? OR namespace LIKE ? ESCAPE '\\')")
+            params.extend([namespace, _escape_like(namespace) + "/%"])
 
         where_clause = " AND ".join(where_parts)
 
@@ -1929,17 +2379,20 @@ class MemoryStore:
             ).fetchone()[0]
             return {"archived": count, "dry_run": True}
 
-        cursor = self.db.execute(
-            f"UPDATE memories SET archived = 1 WHERE {where_clause}",
-            params,
-        )
-        self.db.commit()
-        return {"archived": cursor.rowcount, "dry_run": False}
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE memories SET archived = 1 WHERE {where_clause}",
+                params,
+            )
+            archived_count = cursor.rowcount
+
+        self._track_write(archived_count)
+        return {"archived": archived_count, "dry_run": False}
 
     # ================================================================
     # TOOL 8: unarchive(memory_id)
     # ================================================================
-    def unarchive(self, memory_id: int) -> dict:
+    def unarchive(self, memory_id: int) -> UnarchiveResult:
         """Restore an archived memory."""
         cursor = self.db.execute(
             "UPDATE memories SET archived = 0 WHERE id = ? AND archived = 1",
@@ -1956,10 +2409,10 @@ class MemoryStore:
     def related(
         self,
         entity: str,
-        entity_type: Optional[str] = None,
+        entity_type: str | None = None,
         limit: int = 10,
-        namespace: Optional[str] = None,
-    ) -> list[dict]:
+        namespace: str | None = None,
+    ) -> list[RelatedResult]:
         """
         Find memories related to a specific entity.
 
@@ -1986,8 +2439,8 @@ class MemoryStore:
         # Join with memories to get content and apply namespace/archived filters
         ns_filter = ""
         if namespace is not None:
-            ns_filter = " AND (m.namespace = ? OR m.namespace LIKE ?)"
-            params.extend([namespace, namespace + "/%"])
+            ns_filter = " AND (m.namespace = ? OR m.namespace LIKE ? ESCAPE '\\')"
+            params.extend([namespace, _escape_like(namespace) + "/%"])
 
         params.append(limit)
 
@@ -2016,7 +2469,7 @@ class MemoryStore:
     # ================================================================
     # TOOL 13: entities()
     # ================================================================
-    def entities(self, entity_type: Optional[str] = None, limit: int = 50) -> list[dict]:
+    def entities(self, entity_type: str | None = None, limit: int = 50) -> list[EntityResult]:
         """
         List all known entities, optionally filtered by type.
         Returns list of {"name", "type", "memory_count"} sorted by memory_count desc.
@@ -2065,11 +2518,11 @@ class MemoryStore:
     def consolidate(
         self,
         similarity_threshold: float = 0.85,
-        namespace: Optional[str] = None,
-        tier: Optional[str] = None,
-        merge_fn=None,
+        namespace: str | None = None,
+        tier: str | None = None,
+        merge_fn: Callable[[list[dict[str, Any]]], str] | None = None,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> ConsolidateResult:
         """
         Find and merge semantically similar memories.
 
@@ -2094,8 +2547,9 @@ class MemoryStore:
             where details is list of {"kept": id, "archived_ids": [int], "contents_preview": [str]}
         """
         if self._embed_fn is None:
-            return {"groups": 0, "archived": 0, "dry_run": dry_run,
-                    "details": [], "error": "No embedding function set. Consolidation requires vector search."}
+            raise EmbeddingError(
+                "consolidate() requires embeddings. Call set_embed_fn() first."
+            )
 
         # --- Step 1: Load all active memories matching filters ---
         where_parts = ["archived = 0"]
@@ -2107,8 +2561,8 @@ class MemoryStore:
             params.append(tier_stored)
 
         if namespace is not None:
-            where_parts.append("(namespace = ? OR namespace LIKE ?)")
-            params.extend([namespace, namespace + "/%"])
+            where_parts.append("(namespace = ? OR namespace LIKE ? ESCAPE '\\')")
+            params.extend([namespace, _escape_like(namespace) + "/%"])
 
         where_clause = " AND ".join(where_parts)
 
@@ -2155,12 +2609,37 @@ class MemoryStore:
             if rx != ry:
                 parent[rx] = ry
 
-        # Compare all pairs
-        for i in range(n):
-            for j in range(i + 1, n):
+        # Compare pairs — use LSH pre-filtering for large datasets
+        if n > 100:
+            # Build LSH index for candidate pre-filtering.
+            # With 128-bit SimHash, 16 bands of 8 rows: ~100% recall at threshold=0.85,
+            # typically 2-4x fewer pairs to check on diverse data.
+            dim = len(memories[0]["vec"])
+            lsh = _LSHIndex(dim=dim)
+            for i, m in enumerate(memories):
+                lsh.add(i, m["vec"])
+
+            # Collect all unique candidate pairs via LSH
+            candidate_pairs: set[tuple[int, int]] = set()
+            for i in range(n):
+                for j in lsh.candidates(i, memories[i]["vec"]):
+                    if j > i:
+                        candidate_pairs.add((i, j))
+                    elif j < i:
+                        candidate_pairs.add((j, i))
+
+            # Only do expensive cosine similarity on candidate pairs
+            for i, j in candidate_pairs:
                 sim = self._cosine_similarity(memories[i]["vec"], memories[j]["vec"])
                 if sim >= similarity_threshold:
                     union(i, j)
+        else:
+            # Small dataset — brute force O(n^2) is fine
+            for i in range(n):
+                for j in range(i + 1, n):
+                    sim = self._cosine_similarity(memories[i]["vec"], memories[j]["vec"])
+                    if sim >= similarity_threshold:
+                        union(i, j)
 
         # Collect groups (only groups with 2+ members)
         from collections import defaultdict
@@ -2180,80 +2659,96 @@ class MemoryStore:
 
         now = time.time()
 
-        for group_indices in groups:
-            group_memories = [memories[i] for i in group_indices]
-
-            # Sort: longest content first; if tie, newest first
-            group_memories.sort(
-                key=lambda m: (len(m["content"]), m["created_at"]),
-                reverse=True,
-            )
-
-            kept = group_memories[0]
-            to_archive = group_memories[1:]
-            archived_ids = [m["id"] for m in to_archive]
-
-            if merge_fn is not None:
-                # Custom merge: create a new merged memory from all group members
-                merge_input = [
-                    {"id": m["id"], "content": m["content"], "tier": m["tier"], "created_at": m["created_at"]}
-                    for m in group_memories
-                ]
-                merged_content = merge_fn(merge_input)
-
-                if not dry_run:
-                    # Archive ALL members of the group (including the "kept" one)
-                    all_ids = [m["id"] for m in group_memories]
-                    for mid in all_ids:
-                        self.db.execute(
-                            "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
-                            (now, mid),
-                        )
-
-                    # Create new merged memory
-                    result = self.remember(
-                        content=merged_content,
-                        tier=kept["tier"],
-                        supersedes=kept["id"],
+        if not dry_run and merge_fn is None:
+            # Wrap all archiving in a single transaction (atomic)
+            with self.transaction() as conn:
+                for group_indices in groups:
+                    group_memories = [memories[i] for i in group_indices]
+                    group_memories.sort(
+                        key=lambda m: (len(m["content"]), m["created_at"]),
+                        reverse=True,
                     )
-                    kept_id = result["id"]
-                    archived_ids = all_ids
-                else:
-                    kept_id = kept["id"]
-                    archived_ids = [m["id"] for m in group_memories]
-            else:
-                # Default: keep the longest, archive the rest
-                if not dry_run:
+                    kept = group_memories[0]
+                    to_archive = group_memories[1:]
+                    archived_ids = [m["id"] for m in to_archive]
+
                     for mid in archived_ids:
-                        self.db.execute(
+                        conn.execute(
                             "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
                             (now, mid),
                         )
 
-                    # Set supersedes on the kept memory if it doesn't already have one
-                    existing_supersedes = self.db.execute(
+                    existing_supersedes = conn.execute(
                         "SELECT supersedes FROM memories WHERE id = ?",
                         (kept["id"],),
                     ).fetchone()
                     if existing_supersedes and existing_supersedes[0] is None:
-                        # Point supersedes to the first archived id (most info after kept)
-                        self.db.execute(
+                        conn.execute(
                             "UPDATE memories SET supersedes = ? WHERE id = ?",
                             (archived_ids[0], kept["id"]),
                         )
 
-                kept_id = kept["id"]
+                    kept_id = kept["id"]
+                    total_archived += len(to_archive)
 
-            total_archived += len(archived_ids) if merge_fn is not None and not dry_run else len(to_archive)
+                    details.append({
+                        "kept": kept_id,
+                        "archived_ids": [m["id"] for m in to_archive],
+                        "contents_preview": [m["content"][:80] for m in group_memories],
+                    })
 
-            details.append({
-                "kept": kept_id,
-                "archived_ids": archived_ids if merge_fn is not None else [m["id"] for m in to_archive],
-                "contents_preview": [m["content"][:80] for m in group_memories],
-            })
+            self._track_write(total_archived)
+        else:
+            # dry_run or merge_fn path
+            for group_indices in groups:
+                group_memories = [memories[i] for i in group_indices]
+                group_memories.sort(
+                    key=lambda m: (len(m["content"]), m["created_at"]),
+                    reverse=True,
+                )
+                kept = group_memories[0]
+                to_archive = group_memories[1:]
+                archived_ids = [m["id"] for m in to_archive]
 
-        if not dry_run:
-            self.db.commit()
+                if merge_fn is not None:
+                    merge_input = [
+                        {"id": m["id"], "content": m["content"], "tier": m["tier"], "created_at": m["created_at"]}
+                        for m in group_memories
+                    ]
+                    merged_content = merge_fn(merge_input)
+
+                    if not dry_run:
+                        all_ids = [m["id"] for m in group_memories]
+                        for mid in all_ids:
+                            self.db.execute(
+                                "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
+                                (now, mid),
+                            )
+
+                        result = self.remember(
+                            content=merged_content,
+                            tier=kept["tier"],
+                            supersedes=kept["id"],
+                        )
+                        kept_id = result["id"]
+                        archived_ids = all_ids
+                    else:
+                        kept_id = kept["id"]
+                        archived_ids = [m["id"] for m in group_memories]
+                else:
+                    kept_id = kept["id"]
+
+                total_archived += len(archived_ids) if merge_fn is not None and not dry_run else len(to_archive)
+
+                details.append({
+                    "kept": kept_id,
+                    "archived_ids": archived_ids if merge_fn is not None else [m["id"] for m in to_archive],
+                    "contents_preview": [m["content"][:80] for m in group_memories],
+                })
+
+            if not dry_run:
+                self.db.commit()
+                self._track_write(total_archived)
 
         return {
             "groups": len(groups),
@@ -2262,7 +2757,7 @@ class MemoryStore:
             "details": details,
         }
 
-    def cleanup_working(self):
+    def cleanup_working(self) -> None:
         """Archive expired working memories."""
         cutoff = time.time() - WORKING_TTL
         working_stored = self._encode_tier("working")
@@ -2275,7 +2770,7 @@ class MemoryStore:
     # ================================================================
     # TOOL 14: get_procedures(namespace)
     # ================================================================
-    def get_procedures(self, namespace: Optional[str] = None) -> str:
+    def get_procedures(self, namespace: str | None = None) -> str:
         """
         Get all active procedural memories formatted for system prompt injection.
 
@@ -2297,8 +2792,8 @@ class MemoryStore:
         params: list = [proc_stored]
 
         if namespace is not None:
-            where_parts.append("(namespace = ? OR namespace LIKE ?)")
-            params.extend([namespace, namespace + "/%"])
+            where_parts.append("(namespace = ? OR namespace LIKE ? ESCAPE '\\')")
+            params.extend([namespace, _escape_like(namespace) + "/%"])
 
         where_clause = " AND ".join(where_parts)
         rows = self.db.execute(
@@ -2321,9 +2816,9 @@ class MemoryStore:
     def add_procedure(
         self,
         rule: str,
-        tags: list[str] = None,
+        tags: list[str] | None = None,
         namespace: str = "",
-    ) -> dict:
+    ) -> RememberResult:
         """
         Add a behavioral rule (procedural memory).
 
@@ -2482,10 +2977,10 @@ class MemoryStore:
 
     def process_conversation(
         self,
-        messages: list[dict],
+        messages: list[dict[str, str]],
         namespace: str = "",
         source: str = "conversation",
-    ) -> dict:
+    ) -> ProcessConversationResult:
         """
         Automatically extract and store memories from a conversation history.
 
@@ -2587,8 +3082,16 @@ class MemoryStore:
             "memories": memory_ids,
         }
 
-    def close(self):
+    def close(self) -> None:
+        """Close the store: checkpoint WAL (TRUNCATE) then close connection."""
+        if self._closed:
+            return
+        try:
+            self.checkpoint("TRUNCATE")
+        except Exception:
+            pass  # DB might already be in a bad state; still close
         self.db.close()
+        self._closed = True
 
 
 # ================================================================

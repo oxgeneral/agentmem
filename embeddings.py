@@ -7,7 +7,9 @@ Null: no embeddings (FTS5 keyword search only).
 
 The goal: semantic search WITHOUT PyTorch (1.5GB).
 """
-from typing import Protocol, Optional
+from __future__ import annotations
+
+from typing import Callable, Protocol
 import hashlib
 import math
 import struct
@@ -106,7 +108,7 @@ class HashEmbedding:
 
     @staticmethod
     @lru_cache(maxsize=4096)
-    def _hash_to_indices_signs_cached(token: str, dim: int, k: int) -> tuple:
+    def _hash_to_indices_signs_cached(token: str, dim: int, k: int) -> tuple[tuple[int, float], ...]:
         """
         Map a token to k (index, sign) pairs using its MD5 digest.
 
@@ -128,7 +130,7 @@ class HashEmbedding:
             result.append((idx, sign))
         return tuple(result)
 
-    def _hash_to_indices_signs(self, token: str) -> tuple:
+    def _hash_to_indices_signs(self, token: str) -> tuple[tuple[int, float], ...]:
         return self._hash_to_indices_signs_cached(token, self._dim, self._k)
 
     # ------------------------------------------------------------------
@@ -171,12 +173,12 @@ class Model2VecEmbedding:
     English-focused but works for mixed content.
     """
 
-    def __init__(self, model_name: str = "minishlab/potion-base-8M"):
+    def __init__(self, model_name: str = "minishlab/potion-base-8M") -> None:
         from model2vec import StaticModel
         self._model = StaticModel.from_pretrained(model_name)
         # Get dim from a test embedding
         test = self._model.encode(["test"])
-        self.dim = test.shape[1]
+        self.dim: int = test.shape[1]
 
     def embed(self, text: str) -> list[float]:
         vec = self._model.encode([text])[0]
@@ -194,12 +196,12 @@ class Model2VecEmbedding:
 class NullEmbedding:
     """No embeddings — FTS5 keyword search only. Zero dependencies."""
 
-    dim = 0
+    dim: int = 0
 
-    def embed(self, text: str) -> Optional[list[float]]:
+    def embed(self, text: str) -> list[float] | None:
         return None
 
-    def embed_batch(self, texts: list[str]) -> list[Optional[list[float]]]:
+    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
         return [None] * len(texts)
 
 
@@ -227,13 +229,13 @@ class LazyEmbedding:
                     (e.g. model2vec potion-base-8M is always 256d).
     """
 
-    def __init__(self, factory_fn, known_dim: int = None):
+    def __init__(self, factory_fn: Callable[[], EmbeddingModel], known_dim: int | None = None):
         self._factory = factory_fn
-        self._model = None
+        self._model: EmbeddingModel | None = None
         self._known_dim = known_dim
 
     @property
-    def dim(self):
+    def dim(self) -> int:
         """
         Dimension of the embedding vectors.
         If known_dim was provided at construction, returns it immediately
@@ -243,7 +245,7 @@ class LazyEmbedding:
             return self._known_dim
         return self._get_model().dim
 
-    def _get_model(self):
+    def _get_model(self) -> EmbeddingModel:
         """Load model on first access (thread-safe-enough for single-process use)."""
         if self._model is None:
             self._model = self._factory()

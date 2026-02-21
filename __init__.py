@@ -10,7 +10,7 @@ Usage:
     # Initialize
     embed = get_embedding_model()  # auto-selects best available
     store = MemoryStore("memory.db", embedding_dim=embed.dim)
-    store.set_embed_fn(embed.embed)
+    store.set_embed_fn(embed)
 
     # Store
     store.remember("Alexander's Telegram ID is 252708838", tier="core")
@@ -21,8 +21,49 @@ Usage:
     # Save state before context compression
     store.save_state("Working on feature X, step 3 of 5, blocked by Y")
 """
-from .core import MemoryStore, TIERS
-from .embeddings import get_embedding_model
+from .core import (
+    MemoryStore, TIERS,
+    AgentMemError, MemoryNotFoundError, InvalidTierError, EmbeddingError,
+    # TypedDict return types for public API
+    RememberResult,
+    BatchResult,
+    RecallResult,
+    SaveStateResult,
+    TodayResult,
+    ForgetResult,
+    UnarchiveResult,
+    StatsResult,
+    CompactResult,
+    ConsolidateResult,
+    UpdateResult,
+    HistoryItem,
+    RelatedResult,
+    EntityResult,
+    ImportResult,
+    ProcessConversationResult,
+)
+from .embeddings import get_embedding_model, EmbeddingModel
 
-__version__ = "0.2.0"
-__all__ = ["MemoryStore", "get_embedding_model", "TIERS"]
+__version__ = "0.3.0"
+__all__ = [
+    "MemoryStore", "get_embedding_model", "TIERS",
+    "AgentMemError", "MemoryNotFoundError", "InvalidTierError", "EmbeddingError",
+    "EmbeddingModel",
+    # TypedDict return types
+    "RememberResult",
+    "BatchResult",
+    "RecallResult",
+    "SaveStateResult",
+    "TodayResult",
+    "ForgetResult",
+    "UnarchiveResult",
+    "StatsResult",
+    "CompactResult",
+    "ConsolidateResult",
+    "UpdateResult",
+    "HistoryItem",
+    "RelatedResult",
+    "EntityResult",
+    "ImportResult",
+    "ProcessConversationResult",
+]

@@ -1,0 +1,53 @@
+{
+  "version": "0.2.0",
+  "python": "3.12.3",
+  "platform": "Linux-6.8.0-48-generic-x86_64-with-glibc2.39",
+  "embedding": "HashEmbedding 128d",
+  "runs_per_benchmark": 5,
+  "results": {
+    "cold_start": {
+      "empty_db_s": 0.003513835006742738,
+      "with_100_s": 0.0004003189969807863,
+      "with_1000_s": 0.0005129900091560557
+    },
+    "import": {
+      "batch_per_chunk_s": 0.00011235586003749632,
+      "batch_100_total_s": 0.011235586003749631,
+      "single_per_chunk_s": 0.00031466812986764126,
+      "single_100_total_s": 0.031466812986764126
+    },
+    "query": {
+      "hybrid_100_s": 0.0010308530007023364,
+      "fts_100_s": 0.0005657387984683738,
+      "vec_100_s": 0.0002763831987977028,
+      "hybrid_1000_s": 0.0010863987990887836,
+      "fts_1000_s": 0.0007868926011724397,
+      "vec_1000_s": 0.00017089580069296062
+    },
+    "throughput": {
+      "remember_per_sec": 3996.9490480954455,
+      "batch_per_sec": 10691.925275734146
+    },
+    "entity_extraction": {
+      "per_text_s": 1.0564869953668676e-05
+    },
+    "importance_scoring": {
+      "per_text_s": 8.394105025217868e-06
+    },
+    "compact": {
+      "compact_100_s": 0.0006242189992917702,
+      "compact_500_s": 0.0015884930035099387,
+      "compact_1000_s": 0.003383553004823625
+    },
+    "consolidate": {
+      "consolidate_50_s": 0.016416359998402186,
+      "consolidate_100_s": 0.030004326996277086,
+      "consolidate_200_s": 0.07792247700854205
+    },
+    "storage": {
+      "db_10_bytes": 630784,
+      "db_100_bytes": 663552,
+      "db_1000_bytes": 835584
+    }
+  }
+}

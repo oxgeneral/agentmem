@@ -27,6 +27,10 @@ import sys
 import argparse
 from pathlib import Path
 
+from .core import (
+    MemoryNotFoundError, InvalidTierError, EmbeddingError, AgentMemError,
+)
+
 # MCP protocol via stdin/stdout (stdio transport)
 # This is the simplest, most universal MCP transport
 
@@ -699,12 +703,51 @@ def _call_tool(req_id, tool_name: str, args: dict) -> dict:
             },
         }
 
+    except MemoryNotFoundError as e:
+        hint = "Use the recall tool to search for memory IDs."
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": f"Error: {e}\nHint: {hint}"}],
+                "isError": True,
+            },
+        }
+    except InvalidTierError as e:
+        hint = "Valid tiers: core, learned, episodic, working, procedural."
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": f"Error: {e}\nHint: {hint}"}],
+                "isError": True,
+            },
+        }
+    except EmbeddingError as e:
+        hint = "Check that the embedding backend is configured correctly."
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": f"Error: {e}\nHint: {hint}"}],
+                "isError": True,
+            },
+        }
+    except AgentMemError as e:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": f"Error: {e}"}],
+                "isError": True,
+            },
+        }
     except Exception as e:
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+                "content": [{"type": "text", "text": f"Error: {type(e).__name__}: {e}"}],
                 "isError": True,
             },
         }
@@ -777,9 +820,6 @@ def _format_today_results(results: list[dict]) -> str:
 
 def _format_consolidate_results(result: dict) -> str:
     """Format consolidation results as readable text."""
-    if "error" in result:
-        return f"Error: {result['error']}"
-
     if result["groups"] == 0:
         return "No duplicate groups found."
 
