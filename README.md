@@ -1,5 +1,7 @@
 # agentmem
 
+mcp-name: io.github.oxgeneral/agentmem
+
 Lightweight persistent memory for AI agents. One SQLite file. Hybrid search (keywords + semantics). Zero to 12MB install.
 
 No PyTorch. No cloud. No server. Just memory.
