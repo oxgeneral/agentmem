@@ -1,13 +1,23 @@
 """
 agentmem.server — MCP server for agent memory.
 
-6 tools:
+16 tools:
 1. recall(query) — hybrid search (keywords + semantics)
 2. remember(content) — store a new memory
 3. save_state(state) — emergency save before context compression
 4. today() — what happened today
 5. forget(memory_id) — archive a memory
 6. stats() — memory statistics
+7. compact() — archive low-value memories to reduce noise
+8. unarchive(memory_id) — restore an archived memory
+9. update_memory(old_id, new_content) — replace a memory, preserving version chain
+10. history(memory_id) — get version history of a memory
+11. consolidate() — find and merge semantically similar memories
+12. related(entity) — find memories connected to the same entity
+13. entities() — list all known entities
+14. get_procedures() — get all procedural memories formatted for system prompt
+15. add_procedure(rule) — add a behavioral rule (procedural memory)
+16. process_conversation(messages) — auto-extract facts/decisions/todos from chat history
 
 Run: python -m agentmem.server [--db memory.db] [--port 8422]
 """
@@ -66,8 +76,29 @@ TOOLS = [
                 },
                 "tier": {
                     "type": "string",
-                    "description": "Filter by tier: core, learned, episodic, working. Omit for all.",
-                    "enum": ["core", "learned", "episodic", "working"],
+                    "description": "Filter by tier: core, learned, episodic, working, procedural. Omit for all.",
+                    "enum": ["core", "learned", "episodic", "working", "procedural"],
+                },
+                "recency_weight": {
+                    "type": "number",
+                    "description": "How much recency affects scoring (0.0-1.0). Default 0.1.",
+                    "default": 0.1,
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": (
+                        "Filter by namespace (prefix match). "
+                        "E.g. 'agent' matches 'agent', 'agent/alice', 'agent/bob'. "
+                        "Omit to search all namespaces."
+                    ),
+                },
+                "current_only": {
+                    "type": "boolean",
+                    "description": (
+                        "If true (default), exclude memories that have been superseded "
+                        "by a newer version. Set to false to include all versions."
+                    ),
+                    "default": True,
                 },
             },
             "required": ["query"],
@@ -94,9 +125,10 @@ TOOLS = [
                         "core (permanent facts), "
                         "learned (discovered knowledge), "
                         "episodic (what happened), "
-                        "working (current task state, auto-expires)."
+                        "working (current task state, auto-expires), "
+                        "procedural (behavioral rules for system prompt)."
                     ),
-                    "enum": ["core", "learned", "episodic", "working"],
+                    "enum": ["core", "learned", "episodic", "working", "procedural"],
                     "default": "learned",
                 },
                 "tags": {
@@ -107,6 +139,10 @@ TOOLS = [
                 "source": {
                     "type": "string",
                     "description": "Where this memory came from (file, tool, conversation).",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace for memory isolation (e.g. 'agent/alice'). Default: global.",
                 },
             },
             "required": ["content"],
@@ -130,6 +166,10 @@ TOOLS = [
                         "what's left to do, any blockers."
                     ),
                 },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace for state isolation. Default: global.",
+                },
             },
             "required": ["state"],
         },
@@ -142,7 +182,12 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Filter by namespace (prefix match). Omit for all.",
+                },
+            },
         },
     },
     {
@@ -158,6 +203,10 @@ TOOLS = [
                     "type": "integer",
                     "description": "ID of the memory to archive.",
                 },
+                "namespace": {
+                    "type": "string",
+                    "description": "Safety guard: only forget if memory belongs to this namespace.",
+                },
             },
             "required": ["memory_id"],
         },
@@ -170,7 +219,299 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Filter stats by namespace (prefix match). Omit for all.",
+                },
+            },
+        },
+    },
+    {
+        "name": "compact",
+        "description": (
+            "Archive low-value memories to reduce noise in search results. "
+            "Archives memories older than max_age_days with access_count <= min_access. "
+            "Core and procedural tier memories are never auto-archived. "
+            "Use dry_run=true to preview how many would be archived."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_age_days": {
+                    "type": "integer",
+                    "description": "Archive memories older than this many days (default 90).",
+                    "default": 90,
+                },
+                "min_access": {
+                    "type": "integer",
+                    "description": "Archive memories accessed this many times or less (default 0 = never accessed).",
+                    "default": 0,
+                },
+                "tier": {
+                    "type": "string",
+                    "description": "Only compact this tier. Omit for all tiers except core and procedural.",
+                    "enum": ["learned", "episodic", "working"],
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Only compact this namespace (prefix match).",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, return count without archiving (default false).",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "unarchive",
+        "description": (
+            "Restore an archived memory, making it active and searchable again."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "integer",
+                    "description": "ID of the archived memory to restore.",
+                },
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "update_memory",
+        "description": (
+            "Replace a memory with updated content, preserving the version chain. "
+            "The old memory is archived and linked via supersedes. "
+            "Use this when a fact changes (e.g. IP address, config value). "
+            "Tier, tags, namespace default to the old memory's values if not specified."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "old_id": {
+                    "type": "integer",
+                    "description": "ID of the memory to replace.",
+                },
+                "new_content": {
+                    "type": "string",
+                    "description": "The updated content.",
+                },
+                "tier": {
+                    "type": "string",
+                    "description": "New tier (defaults to old memory's tier).",
+                    "enum": ["core", "learned", "episodic", "working", "procedural"],
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "New tags (defaults to old memory's tags).",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "New namespace (defaults to old memory's namespace).",
+                },
+            },
+            "required": ["old_id", "new_content"],
+        },
+    },
+    {
+        "name": "history",
+        "description": (
+            "Get the version history of a memory. "
+            "Follows the supersedes chain to show all previous versions. "
+            "Returns newest first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "integer",
+                    "description": "ID of the memory to get history for.",
+                },
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "consolidate",
+        "description": (
+            "Find and merge semantically similar memories (near-duplicates). "
+            "Groups memories with cosine similarity above the threshold, "
+            "keeps the longest/newest in each group, and archives the rest. "
+            "Requires an embedding function to be set. "
+            "Use dry_run=true to preview groups without modifying anything."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "similarity_threshold": {
+                    "type": "number",
+                    "description": "Min cosine similarity to consider as duplicates (default 0.85, range 0.0-1.0).",
+                    "default": 0.85,
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Only consolidate within this namespace (prefix match).",
+                },
+                "tier": {
+                    "type": "string",
+                    "description": "Only consolidate this tier.",
+                    "enum": ["core", "learned", "episodic", "working", "procedural"],
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, return groups but don't merge (default false).",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "related",
+        "description": (
+            "Find memories connected to the same entity. "
+            "Entities are auto-extracted from memory content: "
+            "@mentions, URLs, IPs, ports, file paths, env vars, money, etc. "
+            "Use this to discover all memories referencing a specific entity."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Entity name to search for (e.g. '@username', '10.0.0.1', 'OPENAI_API_KEY').",
+                },
+                "entity_type": {
+                    "type": "string",
+                    "description": "Filter by entity type: mention, url, email, hashtag, ip, port, path, money, number_unit, env_var.",
+                    "enum": ["mention", "url", "email", "hashtag", "ip", "port", "path", "money", "number_unit", "env_var"],
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results (default 10).",
+                    "default": 10,
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Filter by namespace (prefix match).",
+                },
+            },
+            "required": ["entity"],
+        },
+    },
+    {
+        "name": "entities",
+        "description": (
+            "List all known entities extracted from memories. "
+            "Shows entity names, types, and how many memories reference each. "
+            "Useful for discovering what entities are stored in memory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entity_type": {
+                    "type": "string",
+                    "description": "Filter by entity type: mention, url, email, hashtag, ip, port, path, money, number_unit, env_var.",
+                    "enum": ["mention", "url", "email", "hashtag", "ip", "port", "path", "money", "number_unit", "env_var"],
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results (default 50).",
+                    "default": 50,
+                },
+            },
+        },
+    },
+    {
+        "name": "get_procedures",
+        "description": (
+            "Get all active procedural memories (behavioral rules) formatted for system prompt injection. "
+            "Returns a markdown-formatted string with all rules as a bullet list. "
+            "If no procedural memories exist, returns empty string. "
+            "Use this at the start of a session to load agent behavioral rules."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Filter by namespace (prefix match). Omit for all.",
+                },
+            },
+        },
+    },
+    {
+        "name": "add_procedure",
+        "description": (
+            "Add a behavioral rule (procedural memory). "
+            "Procedural memories are never auto-expired or auto-compacted. "
+            "They are meant to be injected into the agent's system prompt to modify behavior. "
+            "Examples: 'Always respond in bullet points', 'Never expose API keys'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rule": {
+                    "type": "string",
+                    "description": "The behavioral rule text.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional tags for categorization.",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace for rule isolation (e.g. 'agent/alice'). Default: global.",
+                },
+            },
+            "required": ["rule"],
+        },
+    },
+    {
+        "name": "process_conversation",
+        "description": (
+            "Automatically extract and store memories from a conversation history. "
+            "Scans messages for facts, decisions, preferences, TODOs, config values, "
+            "learnings, and important notes using regex heuristics (no LLM). "
+            "Stores extracted memories with appropriate tiers and tags. "
+            "Accepts standard OpenAI/Anthropic message format."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "description": "Message role: user, assistant, or system.",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Message text content.",
+                            },
+                        },
+                        "required": ["role", "content"],
+                    },
+                    "description": "List of conversation messages in OpenAI/Anthropic format.",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace to store extracted memories in. Default: global.",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source label for extracted memories (default 'conversation').",
+                },
+            },
+            "required": ["messages"],
         },
     },
 ]
@@ -229,6 +570,9 @@ def _call_tool(req_id, tool_name: str, args: dict) -> dict:
                 query=args["query"],
                 limit=args.get("limit", 5),
                 tier=args.get("tier"),
+                recency_weight=args.get("recency_weight"),
+                namespace=args.get("namespace"),
+                current_only=args.get("current_only", True),
             )
             text = _format_recall_results(result)
 
@@ -238,24 +582,107 @@ def _call_tool(req_id, tool_name: str, args: dict) -> dict:
                 tier=args.get("tier", "learned"),
                 tags=args.get("tags", []),
                 source=args.get("source", ""),
+                namespace=args.get("namespace", ""),
             )
             text = json.dumps(result, indent=2)
 
         elif tool_name == "save_state":
-            result = store.save_state(state=args["state"])
+            result = store.save_state(
+                state=args["state"],
+                namespace=args.get("namespace", ""),
+            )
             text = json.dumps(result, indent=2)
 
         elif tool_name == "today":
-            result = store.today()
+            result = store.today(namespace=args.get("namespace"))
             text = _format_today_results(result)
 
         elif tool_name == "forget":
-            result = store.forget(memory_id=args["memory_id"])
+            result = store.forget(
+                memory_id=args["memory_id"],
+                namespace=args.get("namespace"),
+            )
             text = json.dumps(result, indent=2)
 
         elif tool_name == "stats":
-            result = store.stats()
+            result = store.stats(namespace=args.get("namespace"))
             text = json.dumps(result, indent=2)
+
+        elif tool_name == "compact":
+            result = store.compact(
+                max_age_days=args.get("max_age_days", 90),
+                min_access=args.get("min_access", 0),
+                tier=args.get("tier"),
+                namespace=args.get("namespace"),
+                dry_run=args.get("dry_run", False),
+            )
+            text = json.dumps(result, indent=2)
+
+        elif tool_name == "unarchive":
+            result = store.unarchive(memory_id=args["memory_id"])
+            text = json.dumps(result, indent=2)
+
+        elif tool_name == "update_memory":
+            result = store.update_memory(
+                old_id=args["old_id"],
+                new_content=args["new_content"],
+                tier=args.get("tier"),
+                tags=args.get("tags"),
+                namespace=args.get("namespace"),
+            )
+            text = json.dumps(result, indent=2)
+
+        elif tool_name == "history":
+            result = store.history(memory_id=args["memory_id"])
+            text = _format_history_results(result)
+
+        elif tool_name == "consolidate":
+            result = store.consolidate(
+                similarity_threshold=args.get("similarity_threshold", 0.85),
+                namespace=args.get("namespace"),
+                tier=args.get("tier"),
+                dry_run=args.get("dry_run", False),
+            )
+            text = _format_consolidate_results(result)
+
+        elif tool_name == "related":
+            result = store.related(
+                entity=args["entity"],
+                entity_type=args.get("entity_type"),
+                limit=args.get("limit", 10),
+                namespace=args.get("namespace"),
+            )
+            text = _format_related_results(result, args["entity"])
+
+        elif tool_name == "entities":
+            result = store.entities(
+                entity_type=args.get("entity_type"),
+                limit=args.get("limit", 50),
+            )
+            text = _format_entities_results(result)
+
+        elif tool_name == "get_procedures":
+            text = store.get_procedures(
+                namespace=args.get("namespace"),
+            )
+            if not text:
+                text = "(no procedural memories)"
+
+        elif tool_name == "add_procedure":
+            result = store.add_procedure(
+                rule=args["rule"],
+                tags=args.get("tags"),
+                namespace=args.get("namespace", ""),
+            )
+            text = json.dumps(result, indent=2)
+
+        elif tool_name == "process_conversation":
+            result = store.process_conversation(
+                messages=args["messages"],
+                namespace=args.get("namespace", ""),
+                source=args.get("source", "conversation"),
+            )
+            text = _format_process_results(result)
 
         else:
             return {
@@ -290,7 +717,8 @@ def _format_recall_results(results: list[dict]) -> str:
 
     lines = []
     for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] (score: {r['score']:.2f}, tier: {r['tier']}, method: {r['method']})")
+        imp_str = f", importance: {r['importance']:.2f}" if "importance" in r else ""
+        lines.append(f"[{i}] (score: {r['score']:.2f}, tier: {r['tier']}, method: {r['method']}{imp_str})")
         # Truncate long content
         content = r["content"]
         if len(content) > 500:
@@ -298,6 +726,27 @@ def _format_recall_results(results: list[dict]) -> str:
         lines.append(content)
         if r["source"]:
             lines.append(f"  — source: {r['source']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _format_history_results(results: list[dict]) -> str:
+    """Format version history as readable text."""
+    if not results:
+        return "No history found."
+
+    import datetime
+
+    lines = [f"Version history ({len(results)} versions, newest first):\n"]
+    for i, r in enumerate(results):
+        ts = datetime.datetime.fromtimestamp(r["created_at"]).strftime("%Y-%m-%d %H:%M")
+        status = " [archived]" if r["archived"] else " [current]"
+        lines.append(f"  [{i+1}] id={r['id']} {ts}{status}")
+        content = r["content"]
+        if len(content) > 200:
+            content = content[:200] + "..."
+        lines.append(f"      {content}")
         lines.append("")
 
     return "\n".join(lines)
@@ -323,6 +772,70 @@ def _format_today_results(results: list[dict]) -> str:
             content_preview += "..."
         lines.append(f"  [{ts}] {content_preview}")
 
+    return "\n".join(lines)
+
+
+def _format_consolidate_results(result: dict) -> str:
+    """Format consolidation results as readable text."""
+    if "error" in result:
+        return f"Error: {result['error']}"
+
+    if result["groups"] == 0:
+        return "No duplicate groups found."
+
+    prefix = "Dry run: " if result["dry_run"] else ""
+    lines = [f"{prefix}{result['groups']} group(s) found, {result['archived']} memories {'would be ' if result['dry_run'] else ''}archived.\n"]
+
+    for i, detail in enumerate(result["details"], 1):
+        lines.append(f"Group {i}: kept id={detail['kept']}, archived {len(detail['archived_ids'])} memories")
+        for preview in detail["contents_preview"]:
+            lines.append(f"  - {preview}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _format_related_results(results: list[dict], entity: str) -> str:
+    """Format related memories as readable text."""
+    if not results:
+        return f"No memories found related to '{entity}'."
+
+    lines = [f"Memories related to '{entity}' ({len(results)} found):\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] id={r['id']} tier={r['tier']} entity={r['entity_name']} ({r['entity_type']})")
+        content = r["content"]
+        if len(content) > 300:
+            content = content[:300] + "..."
+        lines.append(f"  {content}")
+        if r["source"]:
+            lines.append(f"  — source: {r['source']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _format_entities_results(results: list[dict]) -> str:
+    """Format entities list as readable text."""
+    if not results:
+        return "No entities found."
+
+    lines = [f"Known entities ({len(results)}):\n"]
+    for r in results:
+        lines.append(f"  {r['name']} ({r['type']}) — {r['memory_count']} memories")
+
+    return "\n".join(lines)
+
+
+def _format_process_results(result: dict) -> str:
+    """Format process_conversation results as readable text."""
+    if result["extracted"] == 0:
+        return "No extractable patterns found in the conversation."
+
+    lines = [f"Extracted {result['extracted']} memories from conversation:\n"]
+    for etype, count in sorted(result["by_type"].items()):
+        lines.append(f"  {etype}: {count}")
+    if result["memories"]:
+        lines.append(f"\nStored memory IDs: {result['memories']}")
     return "\n".join(lines)
 
 

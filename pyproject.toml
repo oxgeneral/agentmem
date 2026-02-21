@@ -4,8 +4,8 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "agentmem"
-version = "0.1.0"
-description = "Lightweight persistent memory for AI agents. One SQLite file. Hybrid search. 12MB total."
+version = "0.2.0"
+description = "Lightweight persistent memory for AI agents. One SQLite file. 16 tools. Zero to 12MB."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -40,6 +40,7 @@ all = [
 
 [project.scripts]
 agentmem = "agentmem.cli:main"
+agentmem-http = "agentmem.http_server:main"
 
 [project.urls]
 Homepage = "https://github.com/oxgeneral/agentmem"

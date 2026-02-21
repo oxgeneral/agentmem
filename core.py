@@ -17,13 +17,13 @@ from pathlib import Path
 from typing import Optional
 
 # Tiers: how important/permanent is this memory?
-TIERS = ("core", "learned", "episodic", "working")
+TIERS = ("core", "learned", "episodic", "working", "procedural")
 
 # Working memories auto-expire after this many seconds
 WORKING_TTL = 86400  # 24 hours
 
 # Compact tier encoding: TEXT → INTEGER for storage (saves 5-6 bytes per row)
-_TIER_TO_INT = {"core": 0, "learned": 1, "episodic": 2, "working": 3}
+_TIER_TO_INT = {"core": 0, "learned": 1, "episodic": 2, "working": 3, "procedural": 4}
 _INT_TO_TIER = {v: k for k, v in _TIER_TO_INT.items()}
 
 
@@ -248,10 +248,14 @@ class MemoryStore:
         db_path: str = "memory.db",
         embedding_dim: int = 256,
         quantize: bool = False,
+        recency_weight: float = 0.1,
+        decay_rate: float = 0.01,
     ):
         self.db_path = Path(db_path)
         self.dim = embedding_dim
         self.quantize = quantize  # int8 vector quantization (4x storage reduction)
+        self.recency_weight = recency_weight  # default recency factor in hybrid scoring
+        self.decay_rate = decay_rate          # exponential decay rate (per hour)
         self._embed_fn = None        # set via set_embed_fn()
         self._embed_batch_fn = None  # set via set_embed_fn() when model object passed
         self._vec_index: Optional[_VecIndex] = None
@@ -319,10 +323,15 @@ class MemoryStore:
                     tier INTEGER NOT NULL DEFAULT 1,
                     source TEXT DEFAULT '',
                     tags TEXT DEFAULT '',
+                    namespace TEXT DEFAULT '',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     archived INTEGER DEFAULT 0,
-                    content_hash BLOB UNIQUE
+                    content_hash BLOB UNIQUE,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed REAL,
+                    supersedes INTEGER DEFAULT NULL,
+                    importance REAL DEFAULT 0.5
                 )
             """)
             self._schema_mode = "compact"
@@ -388,6 +397,38 @@ class MemoryStore:
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_archived ON memories(archived)")
 
+        # Migration: add columns safely for existing DBs
+        for col_def in (
+            "access_count INTEGER DEFAULT 0",
+            "last_accessed REAL",
+            "namespace TEXT DEFAULT ''",
+            "supersedes INTEGER DEFAULT NULL",
+            "importance REAL DEFAULT 0.5",
+        ):
+            try:
+                self.db.execute(f"ALTER TABLE memories ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # Index for namespace queries
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_namespace ON memories(namespace)")
+
+        # Index for supersedes lookups (temporal versioning)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_supersedes ON memories(supersedes)")
+
+        # Entities table for lightweight entity extraction
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                memory_id INTEGER NOT NULL,
+                FOREIGN KEY (memory_id) REFERENCES memories(id)
+            )
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_entity_name ON entities(name)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_entity_memory ON entities(memory_id)")
+
         self.db.commit()
 
     def set_embed_fn(self, fn):
@@ -447,7 +488,7 @@ class MemoryStore:
     def _encode_tier(self, tier: str):
         """
         Encode tier string to storage value.
-        Compact schema: returns int (0-3).
+        Compact schema: returns int (0-4).
         Legacy schema:  returns str unchanged.
         """
         if self._schema_mode == "compact":
@@ -491,6 +532,188 @@ class MemoryStore:
         return [t.strip() for t in raw.split(",") if t.strip()]
 
     # ================================================================
+    # Entity extraction (regex-based, no LLM)
+    # ================================================================
+    @staticmethod
+    def _extract_entities(text: str) -> list[tuple[str, str]]:
+        """
+        Extract (name, type) entity pairs from text using regex patterns.
+
+        Entity types detected:
+        - mention: @username patterns
+        - url: http/https URLs
+        - email: email addresses
+        - hashtag: #tag patterns
+        - ip: IPv4 addresses
+        - port: :PORT numbers
+        - path: /unix/file/paths and ~/paths
+        - money: $50, $1,000 etc.
+        - number_unit: 100MB, 8080ms, 2.5GB etc.
+        - env_var: ENV_VAR_NAMES (all-caps with underscores, 3+ chars)
+
+        Returns list of (entity_name, entity_type) tuples, deduplicated.
+        """
+        results: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(name: str, etype: str):
+            key = (name.lower(), etype)
+            if key not in seen:
+                seen.add(key)
+                results.append((name, etype))
+
+        # Order matters: more specific patterns first to avoid overlapping matches
+
+        # email (before url and mention to avoid partial matches)
+        for m in re.finditer(r'\S+@\S+\.\S+', text):
+            _add(m.group(), 'email')
+
+        # url
+        for m in re.finditer(r'https?://\S+', text):
+            _add(m.group().rstrip('.,;)'), 'url')
+
+        # mention (skip if part of email)
+        for m in re.finditer(r'@\w+', text):
+            full_context = text[max(0, m.start()-1):m.end()+5]
+            # Skip if this @word is part of an email (char before @ is not space/start)
+            if m.start() > 0 and text[m.start()-1] not in (' ', '\t', '\n', ',', ';', '(', '['):
+                continue
+            _add(m.group(), 'mention')
+
+        # hashtag
+        for m in re.finditer(r'#\w+', text):
+            _add(m.group(), 'hashtag')
+
+        # ip (before port to avoid overlap)
+        for m in re.finditer(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text):
+            _add(m.group(), 'ip')
+
+        # port
+        for m in re.finditer(r':(\d{4,5})\b', text):
+            _add(':' + m.group(1), 'port')
+
+        # path (unix paths starting with / or ~/)
+        for m in re.finditer(r'(?:^|\s)([~/]\S+)', text, re.MULTILINE):
+            path_str = m.group(1)
+            # Must have at least one / separator to be a real path
+            if '/' in path_str and len(path_str) > 2:
+                _add(path_str, 'path')
+
+        # money
+        for m in re.finditer(r'\$\d[\d,]*', text):
+            _add(m.group(), 'money')
+
+        # number_unit
+        for m in re.finditer(r'\b\d+(?:\.\d+)?(?:MB|GB|KB|TB|ms|s|min|hr|h)\b', text):
+            _add(m.group(), 'number_unit')
+
+        # env_var (3+ chars, all caps with underscores, must contain at least one underscore or be 4+ chars)
+        for m in re.finditer(r'\b[A-Z][A-Z0-9_]{2,}\b', text):
+            word = m.group()
+            # Filter out common English words that happen to be all caps
+            if '_' in word or len(word) >= 4:
+                _add(word, 'env_var')
+
+        return results
+
+    def _store_entities(self, memory_id: int, content: str):
+        """Extract entities from content and store them in the entities table."""
+        entities = self._extract_entities(content)
+        if entities:
+            self.db.executemany(
+                "INSERT INTO entities (name, type, memory_id) VALUES (?, ?, ?)",
+                [(name, etype, memory_id) for name, etype in entities],
+            )
+
+    # ================================================================
+    # Importance scoring (computed once on insert)
+    # ================================================================
+    @staticmethod
+    def _compute_importance(content: str, tier: str, entities_count: int = 0) -> float:
+        """
+        Compute importance score (0.0 to 1.0) for a memory using heuristics.
+
+        Factors (weighted):
+        - Tier weight (0.3): core=1.0, procedural=0.9, learned=0.6, episodic=0.4, working=0.2
+        - Content length (0.2): longer = more info, but capped (100-500 chars is ideal)
+        - Specificity (0.2): named entities count (from _extract_entities)
+        - Structure (0.15): has bullet points, numbered lists, key-value pairs
+        - Actionability (0.15): contains action words, decisions, config values
+
+        Returns float in [0.0, 1.0]
+        """
+        # --- Tier weight (30%) ---
+        tier_weights = {
+            "core": 1.0, "procedural": 0.9, "learned": 0.6,
+            "episodic": 0.4, "working": 0.2,
+        }
+        tier_score = tier_weights.get(tier, 0.5)
+
+        # --- Length score (20%) ---
+        length = len(content)
+        if length < 30:
+            length_score = 0.2
+        elif length < 100:
+            # Linear scale from 0.2 to 1.0 over 30-100 chars
+            length_score = 0.2 + 0.8 * (length - 30) / 70.0
+        elif length <= 500:
+            length_score = 1.0
+        elif length <= 800:
+            # Linear scale from 1.0 to 0.7 over 500-800 chars
+            length_score = 1.0 - 0.3 * (length - 500) / 300.0
+        else:
+            length_score = 0.7
+
+        # --- Specificity (20%) ---
+        specificity_score = min(1.0, entities_count / 5.0)
+
+        # --- Structure (15%) ---
+        structure_score = 0.0
+        # Bullet points
+        if re.search(r'^- ', content, re.MULTILINE):
+            structure_score += 0.2
+        if re.search(r'^\* ', content, re.MULTILINE):
+            structure_score += 0.2
+        # Numbered lists
+        if re.search(r'^\d+\. ', content, re.MULTILINE):
+            structure_score += 0.2
+        # Key-value pairs (key: value or key = value)
+        if re.search(r'\w+:\s+\S', content):
+            structure_score += 0.2
+        if re.search(r'\w+=\S', content):
+            structure_score += 0.2
+        # Code blocks
+        if '```' in content:
+            structure_score += 0.2
+        structure_score = min(1.0, structure_score)
+
+        # --- Actionability (15%) ---
+        actionability_score = 0.0
+        content_lower = content.lower()
+        action_words = [
+            "always", "never", "must", "should", "important", "critical",
+            "todo", "fixme", "password", "token", "key", "secret",
+        ]
+        for word in action_words:
+            if word in content_lower:
+                actionability_score += 0.2
+        # Config patterns (KEY=VALUE with uppercase key)
+        if re.search(r'[A-Z_]{3,}=\S', content):
+            actionability_score += 0.2
+        actionability_score = min(1.0, actionability_score)
+
+        # --- Weighted sum ---
+        importance = (
+            0.30 * tier_score
+            + 0.20 * length_score
+            + 0.20 * specificity_score
+            + 0.15 * structure_score
+            + 0.15 * actionability_score
+        )
+
+        return round(max(0.0, min(1.0, importance)), 4)
+
+    # ================================================================
     # TOOL 1: remember(content, tier, tags, source)
     # ================================================================
     def remember(
@@ -499,10 +722,17 @@ class MemoryStore:
         tier: str = "learned",
         tags: list[str] = None,
         source: str = "",
+        namespace: str = "",
+        supersedes: Optional[int] = None,
     ) -> dict:
         """
         Store a new memory. Auto-embeds if embedding function is set.
         Deduplicates by content hash.
+
+        Args:
+            namespace: Optional isolation namespace (e.g. "agent/alice"). Default "" (global).
+            supersedes: Optional ID of an older memory this one replaces. The old memory
+                        is auto-archived to maintain a version chain.
 
         Returns: {"id": int, "tier": str, "embedded": bool}
         """
@@ -533,11 +763,18 @@ class MemoryStore:
 
         # Insert into main table
         cursor = self.db.execute(
-            """INSERT INTO memories (content, tier, source, tags, created_at, updated_at, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (content, tier_stored, source, tags_stored, now, now, content_hash),
+            """INSERT INTO memories (content, tier, source, tags, namespace, created_at, updated_at, content_hash, supersedes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (content, tier_stored, source, tags_stored, namespace, now, now, content_hash, supersedes),
         )
         memory_id = cursor.lastrowid
+
+        # Auto-archive the superseded memory
+        if supersedes is not None:
+            self.db.execute(
+                "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
+                (now, supersedes),
+            )
 
         # Embed and store vector
         embedded = False
@@ -561,13 +798,24 @@ class MemoryStore:
                 except Exception:
                     pass
 
+        # Extract and store entities
+        self._store_entities(memory_id, content)
+
+        # Compute and store importance score
+        entity_count = len(self._extract_entities(content))
+        importance = self._compute_importance(content, tier, entity_count)
+        self.db.execute(
+            "UPDATE memories SET importance = ? WHERE id = ?",
+            (importance, memory_id),
+        )
+
         self.db.commit()
         return {"id": memory_id, "tier": tier, "embedded": embedded, "deduplicated": False}
 
     # ================================================================
     # BATCH INSERT: remember_batch(items)
     # ================================================================
-    def remember_batch(self, items: list[dict]) -> dict:
+    def remember_batch(self, items: list[dict], namespace: str = "") -> dict:
         """
         Store multiple memories efficiently in a single transaction.
 
@@ -579,10 +827,13 @@ class MemoryStore:
 
         Args:
             items: List of dicts, each with keys:
-                   - content (str, required)
-                   - tier    (str, optional, default "learned")
-                   - tags    (list[str], optional)
-                   - source  (str, optional)
+                   - content   (str, required)
+                   - tier      (str, optional, default "learned")
+                   - tags      (list[str], optional)
+                   - source    (str, optional)
+                   - namespace (str, optional, overrides batch-level namespace)
+            namespace: Default namespace for all items. Each item can override
+                       with its own "namespace" key.
 
         Returns:
             {"imported": int, "deduplicated": int, "embedded": int}
@@ -601,11 +852,12 @@ class MemoryStore:
                 tier = "learned"
             tags = item.get("tags") or []
             source = item.get("source") or ""
+            ns = item.get("namespace", namespace)  # per-item overrides batch default
             h = self._content_hash(content)
-            hashed.append((content, tier, tags, source, h))
+            hashed.append((content, tier, tags, source, ns, h))
 
         # --- Step 2: Find which hashes already exist (one query) ---
-        all_hashes = [row[4] for row in hashed]
+        all_hashes = [row[5] for row in hashed]
         # SQLite IN clause — split into chunks if very large (>900 items)
         existing_hashes = set()
         chunk_size = 900
@@ -623,12 +875,12 @@ class MemoryStore:
         deduplicated = 0
 
         for row in hashed:
-            if row[4] in existing_hashes:
+            if row[5] in existing_hashes:
                 deduplicated += 1
             else:
                 new_items.append(row)
                 # Track hash locally to catch duplicates within the same batch
-                existing_hashes.add(row[4])
+                existing_hashes.add(row[5])
 
         if not new_items:
             return {"imported": 0, "deduplicated": deduplicated, "embedded": 0}
@@ -643,19 +895,19 @@ class MemoryStore:
 
         # --- Step 5: Insert all new memories (executemany) ---
         insert_rows = [
-            (content, self._encode_tier(tier), source, self._encode_tags(tags), now, now, h)
-            for content, tier, tags, source, h in new_items
+            (content, self._encode_tier(tier), source, self._encode_tags(tags), ns, now, now, h)
+            for content, tier, tags, source, ns, h in new_items
         ]
         self.db.executemany(
             """INSERT OR IGNORE INTO memories
-               (content, tier, source, tags, created_at, updated_at, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (content, tier, source, tags, namespace, created_at, updated_at, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             insert_rows,
         )
 
         # --- Step 6: Retrieve inserted IDs (needed for vector table) ---
         # We need the auto-assigned IDs. Fetch by hash (we own these hashes).
-        new_hashes = [row[4] for row in new_items]
+        new_hashes = [row[5] for row in new_items]
         hash_to_id = {}
         for i in range(0, len(new_hashes), chunk_size):
             chunk = new_hashes[i:i + chunk_size]
@@ -672,7 +924,7 @@ class MemoryStore:
         if self._embed_fn is not None:
             if self._vec_mode == "sqlite-vec":
                 vec_rows = []
-                for (content, tier, tags, source, h), vec in zip(new_items, vecs):
+                for (content, tier, tags, source, ns, h), vec in zip(new_items, vecs):
                     if vec is not None and h in hash_to_id:
                         vec_rows.append((hash_to_id[h], _serialize_f32(vec)))
                         embedded += 1
@@ -686,7 +938,7 @@ class MemoryStore:
                         pass  # Vector insert failed; keyword search still works
 
             elif self._vec_mode == "pure" and self._vec_index is not None:
-                for (content, tier, tags, source, h), vec in zip(new_items, vecs):
+                for (content, tier, tags, source, ns, h), vec in zip(new_items, vecs):
                     if vec is not None and h in hash_to_id:
                         try:
                             self._vec_index.insert(hash_to_id[h], vec)
@@ -694,7 +946,37 @@ class MemoryStore:
                         except Exception:
                             pass
 
-        # --- Step 8: Single commit ---
+        # --- Step 8: Extract and store entities for all new memories ---
+        entity_rows = []
+        entity_counts = {}  # hash -> entity count (for importance scoring)
+        for content, tier, tags, source, ns, h in new_items:
+            mem_id = hash_to_id.get(h)
+            if mem_id is not None:
+                entities = self._extract_entities(content)
+                entity_counts[h] = len(entities)
+                for name, etype in entities:
+                    entity_rows.append((name, etype, mem_id))
+        if entity_rows:
+            self.db.executemany(
+                "INSERT INTO entities (name, type, memory_id) VALUES (?, ?, ?)",
+                entity_rows,
+            )
+
+        # --- Step 8b: Compute and store importance scores ---
+        importance_rows = []
+        for content, tier, tags, source, ns, h in new_items:
+            mem_id = hash_to_id.get(h)
+            if mem_id is not None:
+                ec = entity_counts.get(h, 0)
+                importance = self._compute_importance(content, tier, ec)
+                importance_rows.append((importance, mem_id))
+        if importance_rows:
+            self.db.executemany(
+                "UPDATE memories SET importance = ? WHERE id = ?",
+                importance_rows,
+            )
+
+        # --- Step 9: Single commit ---
         self.db.commit()
 
         return {
@@ -702,6 +984,117 @@ class MemoryStore:
             "deduplicated": deduplicated,
             "embedded": embedded,
         }
+
+    # ================================================================
+    # TOOL 9: update_memory(old_id, new_content, ...)
+    # ================================================================
+    def update_memory(
+        self,
+        old_id: int,
+        new_content: str,
+        tier: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        namespace: Optional[str] = None,
+    ) -> dict:
+        """
+        Replace a memory with updated content, preserving the version chain.
+
+        The old memory is archived and linked via supersedes.
+        Tier, tags, namespace default to the old memory's values if not specified.
+
+        Returns: {"id": new_id, "supersedes": old_id}
+        """
+        # Fetch old memory to inherit defaults
+        row = self.db.execute(
+            "SELECT content, tier, tags, namespace FROM memories WHERE id = ?",
+            (old_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Memory {old_id} not found")
+
+        old_tier = self._decode_tier(row[1])
+        old_tags = self._decode_tags(row[2])
+        old_namespace = row[3] or ""
+
+        # Use provided values or fall back to old memory's values
+        use_tier = tier if tier is not None else old_tier
+        use_tags = tags if tags is not None else old_tags
+        use_namespace = namespace if namespace is not None else old_namespace
+
+        result = self.remember(
+            content=new_content,
+            tier=use_tier,
+            tags=use_tags,
+            namespace=use_namespace,
+            supersedes=old_id,
+        )
+
+        return {"id": result["id"], "supersedes": old_id}
+
+    # ================================================================
+    # TOOL 10: history(memory_id)
+    # ================================================================
+    def history(self, memory_id: int) -> list[dict]:
+        """
+        Get the version history of a memory (newest first).
+
+        Follows the supersedes chain backward to find all previous versions.
+        Returns list of {"id", "content", "created_at", "archived"}.
+        """
+        chain = []
+
+        # Start from the given memory_id and walk backward
+        current_id = memory_id
+        visited = set()  # guard against cycles
+
+        while current_id is not None and current_id not in visited:
+            visited.add(current_id)
+            row = self.db.execute(
+                "SELECT id, content, created_at, archived, supersedes FROM memories WHERE id = ?",
+                (current_id,),
+            ).fetchone()
+            if row is None:
+                break
+
+            chain.append({
+                "id": row[0],
+                "content": row[1],
+                "created_at": row[2],
+                "archived": bool(row[3]),
+            })
+            current_id = row[4]  # follow supersedes chain backward
+
+        # Also check if there are newer versions that supersede this memory
+        # Walk forward from the original memory_id
+        forward_id = memory_id
+        forward_visited = set()
+        forward_chain = []
+
+        while True:
+            forward_row = self.db.execute(
+                "SELECT id, content, created_at, archived FROM memories WHERE supersedes = ?",
+                (forward_id,),
+            ).fetchone()
+            if forward_row is None or forward_row[0] in forward_visited:
+                break
+            forward_visited.add(forward_row[0])
+            forward_chain.append({
+                "id": forward_row[0],
+                "content": forward_row[1],
+                "created_at": forward_row[2],
+                "archived": bool(forward_row[3]),
+            })
+            forward_id = forward_row[0]
+
+        # Combine: forward chain (newest first) + current chain (already newest first)
+        # forward_chain is oldest-to-newest of items AFTER memory_id
+        # chain starts at memory_id and goes backward
+        # Result should be newest first
+        forward_chain.reverse()  # now newest first
+        # Remove duplicates: chain[0] is memory_id, which is not in forward_chain
+        result = forward_chain + chain
+
+        return result
 
     # ================================================================
     # Query classifier: decide FTS vs vector weights adaptively
@@ -809,6 +1202,10 @@ class MemoryStore:
         query: str,
         limit: int = 5,
         tier: Optional[str] = None,
+        recency_weight: Optional[float] = None,
+        decay_rate: Optional[float] = None,
+        namespace: Optional[str] = None,
+        current_only: bool = True,
     ) -> list[dict]:
         """
         Hybrid search: FTS5 (keywords) + vector search (semantics) → rerank.
@@ -818,13 +1215,28 @@ class MemoryStore:
         2. Vector KNN search → candidates with cosine distance
         3. Merge and rerank → best of both worlds
         4. FTS5 gets boosted for exact keyword matches
+        5. Recency boost: newer memories score slightly higher
+
+        Args:
+            recency_weight: How much recency affects final score (0.0-1.0). Default from constructor.
+            decay_rate: Exponential decay rate per hour. Default from constructor.
+            namespace: Filter by namespace. Prefix match: "agent" matches "agent", "agent/alice", etc.
+                       None means search all namespaces.
+            current_only: If True (default), exclude memories that have been superseded
+                          (i.e., memories whose id appears in another memory's supersedes column).
+                          This ensures only the latest version of each fact is returned.
 
         Returns list of {"id", "content", "tier", "source", "score", "method"}
         """
+        # Use instance defaults if not overridden per-call
+        if recency_weight is None:
+            recency_weight = self.recency_weight
+        if decay_rate is None:
+            decay_rate = self.decay_rate
         candidates = {}  # id -> {data, fts_score, vec_score}
 
         # Step 1: FTS5 keyword search
-        fts_results = self._fts_search(query, limit=limit * 3, tier=tier)
+        fts_results = self._fts_search(query, limit=limit * 3, tier=tier, namespace=namespace)
         for r in fts_results:
             candidates[r["id"]] = {
                 **r,
@@ -838,7 +1250,7 @@ class MemoryStore:
             self._vec_mode in ("sqlite-vec", "pure")
         )
         if can_vec_search:
-            vec_results = self._vec_search(query, limit=limit * 3, tier=tier)
+            vec_results = self._vec_search(query, limit=limit * 3, tier=tier, namespace=namespace)
             for r in vec_results:
                 if r["id"] in candidates:
                     candidates[r["id"]]["vec_score"] = r["score"]
@@ -858,12 +1270,41 @@ class MemoryStore:
             else "hybrid"
         )
 
+        # Fetch created_at and importance for all candidate IDs
+        now = time.time()
+        created_at_map: dict[int, float] = {}
+        importance_map: dict[int, float] = {}
+        if candidates:
+            cand_ids = list(candidates.keys())
+            # Fetch in chunks to stay within SQLite variable limits
+            for i in range(0, len(cand_ids), 900):
+                chunk = cand_ids[i:i + 900]
+                placeholders = ",".join("?" * len(chunk))
+                rows = self.db.execute(
+                    f"SELECT id, created_at, importance FROM memories WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    created_at_map[row[0]] = row[1]
+                    importance_map[row[0]] = row[2] if row[2] is not None else 0.5
+
         results = []
         for mid, data in candidates.items():
             fts = data["fts_score"]
             vec = data["vec_score"]
 
             hybrid = fts_w * fts + vec_w * vec
+
+            # Recency boost: newer memories score slightly higher
+            if recency_weight > 0 and mid in created_at_map:
+                age_hours = max(0.0, (now - created_at_map[mid]) / 3600.0)
+                recency = math.exp(-age_hours * decay_rate)
+                hybrid = hybrid * (1.0 - recency_weight) + recency * recency_weight
+
+            # Importance boost: multiplicative, subtle (0.8x to 1.2x)
+            importance = importance_map.get(mid, 0.5)
+            importance_boost = 0.8 + 0.4 * importance
+            hybrid *= importance_boost
 
             results.append({
                 "id": data["id"],
@@ -872,11 +1313,94 @@ class MemoryStore:
                 "source": data["source"],
                 "score": round(hybrid, 4),
                 "method": method,
+                "importance": round(importance, 4),
             })
+
+        # Temporal versioning filter
+        if current_only and results:
+            # Filter out superseded memories (only keep latest versions)
+            result_ids = [r["id"] for r in results]
+            superseded_ids = set()
+            for i in range(0, len(result_ids), 900):
+                chunk = result_ids[i:i + 900]
+                placeholders = ",".join("?" * len(chunk))
+                rows = self.db.execute(
+                    f"SELECT supersedes FROM memories WHERE supersedes IN ({placeholders}) AND supersedes IS NOT NULL",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    superseded_ids.add(row[0])
+            if superseded_ids:
+                results = [r for r in results if r["id"] not in superseded_ids]
+        elif not current_only:
+            # Include archived superseded versions: for each result that has a
+            # supersedes chain, pull in the older archived versions too.
+            existing_ids = {r["id"] for r in results}
+            # Find all archived memories that are part of supersedes chains
+            # and match any of the current result IDs
+            chain_ids_to_check = list(existing_ids)
+            visited = set(existing_ids)
+            while chain_ids_to_check:
+                batch = chain_ids_to_check[:900]
+                chain_ids_to_check = chain_ids_to_check[900:]
+                placeholders = ",".join("?" * len(batch))
+                # Walk backward: find what these memories supersede
+                rows = self.db.execute(
+                    f"SELECT id, supersedes FROM memories WHERE id IN ({placeholders}) AND supersedes IS NOT NULL",
+                    batch,
+                ).fetchall()
+                for _, sup_id in rows:
+                    if sup_id not in visited:
+                        visited.add(sup_id)
+                        chain_ids_to_check.append(sup_id)
+            # Also walk forward: find memories that supersede any of our results
+            forward_check = list(existing_ids)
+            while forward_check:
+                batch = forward_check[:900]
+                forward_check = forward_check[900:]
+                placeholders = ",".join("?" * len(batch))
+                rows = self.db.execute(
+                    f"SELECT id FROM memories WHERE supersedes IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for (fwd_id,) in rows:
+                    if fwd_id not in visited:
+                        visited.add(fwd_id)
+                        forward_check.append(fwd_id)
+            # Fetch and add any chain members not already in results
+            new_ids = visited - existing_ids
+            if new_ids:
+                for nid in new_ids:
+                    row = self.db.execute(
+                        "SELECT id, content, tier, source FROM memories WHERE id = ?",
+                        (nid,),
+                    ).fetchone()
+                    if row:
+                        results.append({
+                            "id": row[0],
+                            "content": row[1],
+                            "tier": self._decode_tier(row[2]),
+                            "source": row[3],
+                            "score": 0.0,  # no search score for chain members
+                            "method": method,
+                        })
 
         # Sort by hybrid score descending
         results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:limit]
+        final = results[:limit]
+
+        # Update access tracking for returned results
+        if final:
+            returned_ids = [r["id"] for r in final]
+            placeholders = ",".join("?" * len(returned_ids))
+            self.db.execute(
+                f"UPDATE memories SET access_count = access_count + 1, last_accessed = ? "
+                f"WHERE id IN ({placeholders})",
+                [now] + returned_ids,
+            )
+            self.db.commit()
+
+        return final
 
     # English stop words: short, high-frequency, semantically empty
     _EN_STOP = frozenset({
@@ -970,7 +1494,10 @@ class MemoryStore:
 
         return " OR ".join(unique_parts)
 
-    def _fts_search(self, query: str, limit: int = 15, tier: Optional[str] = None) -> list[dict]:
+    def _fts_search(
+        self, query: str, limit: int = 15, tier: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> list[dict]:
         """FTS5 BM25 keyword search with smart query building."""
         fts_query = self._build_fts_query(query)
         if not fts_query:
@@ -979,25 +1506,30 @@ class MemoryStore:
         # Encode tier for comparison (compact=int, legacy=str)
         tier_stored = self._encode_tier(tier) if tier else None
 
+        # Build dynamic WHERE clause for tier + namespace
+        where_parts = ["memories_fts MATCH ?", "m.archived = 0"]
+        params: list = [fts_query]
+
+        if tier_stored is not None:
+            where_parts.append("m.tier = ?")
+            params.append(tier_stored)
+
+        if namespace is not None:
+            where_parts.append("(m.namespace = ? OR m.namespace LIKE ?)")
+            params.extend([namespace, namespace + "/%"])
+
+        where_clause = " AND ".join(where_parts)
+        params.append(limit)
+
         try:
-            if tier_stored is not None:
-                rows = self.db.execute(
-                    """SELECT m.id, m.content, m.tier, m.source, rank
-                       FROM memories_fts f
-                       JOIN memories m ON m.id = f.rowid
-                       WHERE memories_fts MATCH ? AND m.archived = 0 AND m.tier = ?
-                       ORDER BY rank LIMIT ?""",
-                    (fts_query, tier_stored, limit),
-                ).fetchall()
-            else:
-                rows = self.db.execute(
-                    """SELECT m.id, m.content, m.tier, m.source, rank
-                       FROM memories_fts f
-                       JOIN memories m ON m.id = f.rowid
-                       WHERE memories_fts MATCH ? AND m.archived = 0
-                       ORDER BY rank LIMIT ?""",
-                    (fts_query, limit),
-                ).fetchall()
+            rows = self.db.execute(
+                f"""SELECT m.id, m.content, m.tier, m.source, rank
+                    FROM memories_fts f
+                    JOIN memories m ON m.id = f.rowid
+                    WHERE {where_clause}
+                    ORDER BY rank LIMIT ?""",
+                params,
+            ).fetchall()
         except sqlite3.OperationalError:
             return []
 
@@ -1022,20 +1554,24 @@ class MemoryStore:
             })
         return results
 
-    def _vec_search(self, query: str, limit: int = 15, tier: Optional[str] = None) -> list[dict]:
+    def _vec_search(
+        self, query: str, limit: int = 15, tier: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> list[dict]:
         """Vector KNN semantic search. Uses sqlite-vec or pure Python fallback."""
         vec = self._embed(query)
         if vec is None:
             return []
 
         if self._vec_mode == "sqlite-vec":
-            return self._vec_search_sqlite_vec(vec, limit, tier)
+            return self._vec_search_sqlite_vec(vec, limit, tier, namespace)
         elif self._vec_mode == "pure" and self._vec_index is not None:
-            return self._vec_search_pure(vec, limit, tier)
+            return self._vec_search_pure(vec, limit, tier, namespace)
         return []
 
     def _vec_search_sqlite_vec(
-        self, vec: list[float], limit: int, tier: Optional[str]
+        self, vec: list[float], limit: int, tier: Optional[str],
+        namespace: Optional[str] = None,
     ) -> list[dict]:
         """sqlite-vec C extension KNN query."""
         try:
@@ -1049,10 +1585,11 @@ class MemoryStore:
         except Exception:
             return []
 
-        return self._hydrate_vec_results(rows, tier, limit)
+        return self._hydrate_vec_results(rows, tier, limit, namespace)
 
     def _vec_search_pure(
-        self, vec: list[float], limit: int, tier: Optional[str]
+        self, vec: list[float], limit: int, tier: Optional[str],
+        namespace: Optional[str] = None,
     ) -> list[dict]:
         """Pure Python brute-force KNN via _VecIndex."""
         try:
@@ -1060,12 +1597,13 @@ class MemoryStore:
         except Exception:
             return []
 
-        return self._hydrate_vec_results(rows, tier, limit)
+        return self._hydrate_vec_results(rows, tier, limit, namespace)
 
     def _hydrate_vec_results(
-        self, rows: list[tuple], tier: Optional[str], limit: int
+        self, rows: list[tuple], tier: Optional[str], limit: int,
+        namespace: Optional[str] = None,
     ) -> list[dict]:
-        """Fetch metadata for (rowid, distance) pairs and apply tier filter."""
+        """Fetch metadata for (rowid, distance) pairs and apply tier/namespace filter."""
         if not rows:
             return []
 
@@ -1075,13 +1613,18 @@ class MemoryStore:
         results = []
         for rowid, distance in rows:
             meta = self.db.execute(
-                "SELECT id, content, tier, source FROM memories WHERE id = ? AND archived = 0",
+                "SELECT id, content, tier, source, namespace FROM memories WHERE id = ? AND archived = 0",
                 (rowid,),
             ).fetchone()
             if meta is None:
                 continue
             if tier_stored is not None and meta[2] != tier_stored:
                 continue
+            # Namespace prefix filter
+            if namespace is not None:
+                ns = meta[4] or ""
+                if ns != namespace and not ns.startswith(namespace + "/"):
+                    continue
 
             # Convert cosine distance (0=identical, 2=opposite) to score (1=identical, 0=opposite)
             score = max(0.0, 1.0 - distance)
@@ -1098,44 +1641,68 @@ class MemoryStore:
     # ================================================================
     # TOOL 3: save_state(state)
     # ================================================================
-    def save_state(self, state: str) -> dict:
+    def save_state(self, state: str, namespace: str = "") -> dict:
         """
         Save current working state. Replaces previous working state.
         This is the "emergency save before context compression" tool.
+
+        Args:
+            namespace: Isolate state per namespace. Default "" (global).
         """
-        # Archive all previous working memories
+        # Archive all previous working memories (only in this namespace)
         working_stored = self._encode_tier("working")
-        self.db.execute(
-            "UPDATE memories SET archived = 1 WHERE tier = ? AND archived = 0",
-            (working_stored,),
-        )
+        if namespace:
+            self.db.execute(
+                "UPDATE memories SET archived = 1 WHERE tier = ? AND archived = 0 AND namespace = ?",
+                (working_stored, namespace),
+            )
+        else:
+            self.db.execute(
+                "UPDATE memories SET archived = 1 WHERE tier = ? AND archived = 0",
+                (working_stored,),
+            )
 
         result = self.remember(
             content=state,
             tier="working",
             tags=["state"],
             source="save_state",
+            namespace=namespace,
         )
         return {"saved": True, "id": result["id"]}
 
     # ================================================================
     # TOOL 4: today()
     # ================================================================
-    def today(self) -> list[dict]:
-        """Get all memories from today, grouped by tier."""
+    def today(self, namespace: Optional[str] = None) -> list[dict]:
+        """Get all memories from today, grouped by tier.
+
+        Args:
+            namespace: Filter by namespace prefix. None means all namespaces.
+        """
         # Start of today (UTC)
         import datetime
         today_start = datetime.datetime.now(datetime.timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
 
-        rows = self.db.execute(
-            """SELECT id, content, tier, source, created_at
-               FROM memories
-               WHERE created_at >= ? AND archived = 0
-               ORDER BY created_at""",
-            (today_start,),
-        ).fetchall()
+        if namespace is not None:
+            rows = self.db.execute(
+                """SELECT id, content, tier, source, created_at
+                   FROM memories
+                   WHERE created_at >= ? AND archived = 0
+                     AND (namespace = ? OR namespace LIKE ?)
+                   ORDER BY created_at""",
+                (today_start, namespace, namespace + "/%"),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                """SELECT id, content, tier, source, created_at
+                   FROM memories
+                   WHERE created_at >= ? AND archived = 0
+                   ORDER BY created_at""",
+                (today_start,),
+            ).fetchall()
 
         return [
             {
@@ -1151,8 +1718,23 @@ class MemoryStore:
     # ================================================================
     # TOOL 5: forget(memory_id)
     # ================================================================
-    def forget(self, memory_id: int) -> dict:
-        """Soft-delete a memory (archive it). Can be unarchived later."""
+    def forget(self, memory_id: int, namespace: Optional[str] = None) -> dict:
+        """Soft-delete a memory (archive it). Can be unarchived later.
+
+        Args:
+            namespace: If set, only forget if memory belongs to this namespace (safety guard).
+        """
+        if namespace is not None:
+            # Safety: only archive if the memory belongs to this namespace
+            row = self.db.execute(
+                "SELECT namespace FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                return {"forgotten": False, "id": memory_id, "reason": "not found"}
+            mem_ns = row[0] or ""
+            if mem_ns != namespace and not mem_ns.startswith(namespace + "/"):
+                return {"forgotten": False, "id": memory_id, "reason": "namespace mismatch"}
+
         self.db.execute(
             "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
             (time.time(), memory_id),
@@ -1163,24 +1745,36 @@ class MemoryStore:
     # ================================================================
     # TOOL 6: stats()
     # ================================================================
-    def stats(self) -> dict:
-        """Memory statistics."""
+    def stats(self, namespace: Optional[str] = None) -> dict:
+        """Memory statistics.
+
+        Args:
+            namespace: If set, only count memories in this namespace (prefix match).
+        """
+        ns_filter = ""
+        ns_params: list = []
+        if namespace is not None:
+            ns_filter = " AND (namespace = ? OR namespace LIKE ?)"
+            ns_params = [namespace, namespace + "/%"]
+
         total = self.db.execute(
-            "SELECT COUNT(*) FROM memories WHERE archived = 0"
+            f"SELECT COUNT(*) FROM memories WHERE archived = 0{ns_filter}",
+            ns_params,
         ).fetchone()[0]
 
         by_tier = {}
         for tier in TIERS:
             tier_stored = self._encode_tier(tier)
             count = self.db.execute(
-                "SELECT COUNT(*) FROM memories WHERE tier = ? AND archived = 0",
-                (tier_stored,),
+                f"SELECT COUNT(*) FROM memories WHERE tier = ? AND archived = 0{ns_filter}",
+                [tier_stored] + ns_params,
             ).fetchone()[0]
             if count > 0:
                 by_tier[tier] = count
 
         archived = self.db.execute(
-            "SELECT COUNT(*) FROM memories WHERE archived = 1"
+            f"SELECT COUNT(*) FROM memories WHERE archived = 1{ns_filter}",
+            ns_params,
         ).fetchone()[0]
 
         # DB file size
@@ -1188,8 +1782,16 @@ class MemoryStore:
 
         # Latest memory
         latest = self.db.execute(
-            "SELECT created_at FROM memories WHERE archived = 0 ORDER BY created_at DESC LIMIT 1"
+            f"SELECT created_at FROM memories WHERE archived = 0{ns_filter} ORDER BY created_at DESC LIMIT 1",
+            ns_params,
         ).fetchone()
+
+        # Average importance
+        avg_imp_row = self.db.execute(
+            f"SELECT AVG(importance) FROM memories WHERE archived = 0{ns_filter}",
+            ns_params,
+        ).fetchone()
+        avg_importance = round(avg_imp_row[0], 4) if avg_imp_row and avg_imp_row[0] is not None else 0.5
 
         return {
             "total_memories": total,
@@ -1203,12 +1805,13 @@ class MemoryStore:
             "quantize": self.quantize,
             "bytes_per_vector": (8 + self.dim) if self.quantize else (self.dim * 4),
             "latest_memory": latest[0] if latest else None,
+            "avg_importance": avg_importance,
         }
 
     # ================================================================
     # Import/Export
     # ================================================================
-    def import_markdown(self, filepath: str, tier: str = "learned") -> dict:
+    def import_markdown(self, filepath: str, tier: str = "learned", namespace: str = "") -> dict:
         """
         Import a markdown file, chunking by sections.
 
@@ -1229,7 +1832,7 @@ class MemoryStore:
             for chunk in chunks
         ]
 
-        result = self.remember_batch(items)
+        result = self.remember_batch(items, namespace=namespace)
 
         return {
             "file": str(path),
@@ -1265,6 +1868,400 @@ class MemoryStore:
 
         return "\n".join(lines)
 
+    # ================================================================
+    # TOOL 7: compact()
+    # ================================================================
+    def compact(
+        self,
+        max_age_days: int = 90,
+        min_access: int = 0,
+        tier: Optional[str] = None,
+        namespace: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """
+        Archive low-value memories to reduce noise in search results.
+
+        Archives memories that match ALL of these criteria:
+        - Older than max_age_days
+        - access_count <= min_access
+        - Not in 'core' or 'procedural' tier (these are never auto-archived)
+        - Optionally filtered by tier and namespace
+
+        Args:
+            max_age_days: Archive memories older than this (default 90)
+            min_access: Archive memories accessed this many times or less (default 0 = never accessed)
+            tier: Only compact this tier (default: all except core and procedural)
+            namespace: Only compact this namespace
+            dry_run: If True, return count but don't archive
+
+        Returns:
+            {"archived": int, "dry_run": bool}
+        """
+        cutoff = time.time() - max_age_days * 86400
+        core_stored = self._encode_tier("core")
+        proc_stored = self._encode_tier("procedural")
+
+        where_parts = [
+            "archived = 0",
+            "tier != ?",
+            "tier != ?",
+            "created_at < ?",
+            "access_count <= ?",
+        ]
+        params: list = [core_stored, proc_stored, cutoff, min_access]
+
+        if tier is not None:
+            tier_stored = self._encode_tier(tier)
+            where_parts.append("tier = ?")
+            params.append(tier_stored)
+
+        if namespace is not None:
+            where_parts.append("(namespace = ? OR namespace LIKE ?)")
+            params.extend([namespace, namespace + "/%"])
+
+        where_clause = " AND ".join(where_parts)
+
+        if dry_run:
+            count = self.db.execute(
+                f"SELECT COUNT(*) FROM memories WHERE {where_clause}",
+                params,
+            ).fetchone()[0]
+            return {"archived": count, "dry_run": True}
+
+        cursor = self.db.execute(
+            f"UPDATE memories SET archived = 1 WHERE {where_clause}",
+            params,
+        )
+        self.db.commit()
+        return {"archived": cursor.rowcount, "dry_run": False}
+
+    # ================================================================
+    # TOOL 8: unarchive(memory_id)
+    # ================================================================
+    def unarchive(self, memory_id: int) -> dict:
+        """Restore an archived memory."""
+        cursor = self.db.execute(
+            "UPDATE memories SET archived = 0 WHERE id = ? AND archived = 1",
+            (memory_id,),
+        )
+        self.db.commit()
+        if cursor.rowcount == 0:
+            return {"unarchived": False, "id": memory_id, "reason": "not found or not archived"}
+        return {"unarchived": True, "id": memory_id}
+
+    # ================================================================
+    # TOOL 12: related(entity)
+    # ================================================================
+    def related(
+        self,
+        entity: str,
+        entity_type: Optional[str] = None,
+        limit: int = 10,
+        namespace: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Find memories related to a specific entity.
+
+        Searches the entities table for matching entity names (case-insensitive),
+        then returns the associated memories.
+
+        Args:
+            entity: Entity name to search for (e.g. "@username", "10.0.0.1")
+            entity_type: Optional filter by type (mention, url, ip, etc.)
+            limit: Max results
+            namespace: Optional namespace filter
+
+        Returns list of {"id", "content", "tier", "source", "entity_name", "entity_type"}
+        """
+        where_parts = ["LOWER(e.name) = LOWER(?)"]
+        params: list = [entity]
+
+        if entity_type is not None:
+            where_parts.append("e.type = ?")
+            params.append(entity_type)
+
+        where_clause = " AND ".join(where_parts)
+
+        # Join with memories to get content and apply namespace/archived filters
+        ns_filter = ""
+        if namespace is not None:
+            ns_filter = " AND (m.namespace = ? OR m.namespace LIKE ?)"
+            params.extend([namespace, namespace + "/%"])
+
+        params.append(limit)
+
+        rows = self.db.execute(
+            f"""SELECT DISTINCT m.id, m.content, m.tier, m.source, e.name, e.type
+                FROM entities e
+                JOIN memories m ON m.id = e.memory_id
+                WHERE {where_clause} AND m.archived = 0{ns_filter}
+                ORDER BY m.created_at DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+
+        return [
+            {
+                "id": r[0],
+                "content": r[1],
+                "tier": self._decode_tier(r[2]),
+                "source": r[3],
+                "entity_name": r[4],
+                "entity_type": r[5],
+            }
+            for r in rows
+        ]
+
+    # ================================================================
+    # TOOL 13: entities()
+    # ================================================================
+    def entities(self, entity_type: Optional[str] = None, limit: int = 50) -> list[dict]:
+        """
+        List all known entities, optionally filtered by type.
+        Returns list of {"name", "type", "memory_count"} sorted by memory_count desc.
+        """
+        if entity_type is not None:
+            rows = self.db.execute(
+                """SELECT e.name, e.type, COUNT(DISTINCT e.memory_id) as cnt
+                   FROM entities e
+                   JOIN memories m ON m.id = e.memory_id
+                   WHERE e.type = ? AND m.archived = 0
+                   GROUP BY LOWER(e.name), e.type
+                   ORDER BY cnt DESC
+                   LIMIT ?""",
+                (entity_type, limit),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                """SELECT e.name, e.type, COUNT(DISTINCT e.memory_id) as cnt
+                   FROM entities e
+                   JOIN memories m ON m.id = e.memory_id
+                   WHERE m.archived = 0
+                   GROUP BY LOWER(e.name), e.type
+                   ORDER BY cnt DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+        return [
+            {"name": r[0], "type": r[1], "memory_count": r[2]}
+            for r in rows
+        ]
+
+    # ================================================================
+    # TOOL 11: consolidate()
+    # ================================================================
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        """Cosine similarity between two vectors. Returns 0.0-1.0."""
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def consolidate(
+        self,
+        similarity_threshold: float = 0.85,
+        namespace: Optional[str] = None,
+        tier: Optional[str] = None,
+        merge_fn=None,
+        dry_run: bool = False,
+    ) -> dict:
+        """
+        Find and merge semantically similar memories.
+
+        Algorithm:
+        1. Load all active (non-archived) memories (optionally filtered by namespace/tier)
+        2. Embed all of them
+        3. For each pair with cosine similarity > threshold, group them
+        4. For each group: keep the longest/newest memory, archive the rest
+           OR use merge_fn(memories) -> merged_content if provided
+
+        Args:
+            similarity_threshold: Min cosine similarity to consider as duplicates (0.85 default)
+            namespace: Only consolidate within this namespace
+            tier: Only consolidate this tier
+            merge_fn: Optional callback fn(list[dict]) -> str that merges multiple memories
+                      into one. Each dict has {id, content, tier, created_at}.
+                      If None, keeps the longest content and archives the rest.
+            dry_run: If True, return groups but don't modify
+
+        Returns:
+            {"groups": int, "archived": int, "dry_run": bool, "details": list[dict]}
+            where details is list of {"kept": id, "archived_ids": [int], "contents_preview": [str]}
+        """
+        if self._embed_fn is None:
+            return {"groups": 0, "archived": 0, "dry_run": dry_run,
+                    "details": [], "error": "No embedding function set. Consolidation requires vector search."}
+
+        # --- Step 1: Load all active memories matching filters ---
+        where_parts = ["archived = 0"]
+        params: list = []
+
+        if tier is not None:
+            tier_stored = self._encode_tier(tier)
+            where_parts.append("tier = ?")
+            params.append(tier_stored)
+
+        if namespace is not None:
+            where_parts.append("(namespace = ? OR namespace LIKE ?)")
+            params.extend([namespace, namespace + "/%"])
+
+        where_clause = " AND ".join(where_parts)
+
+        rows = self.db.execute(
+            f"SELECT id, content, tier, created_at FROM memories WHERE {where_clause} ORDER BY id",
+            params,
+        ).fetchall()
+
+        if len(rows) < 2:
+            return {"groups": 0, "archived": 0, "dry_run": dry_run, "details": []}
+
+        # --- Step 2: Embed all memories ---
+        texts = [row[1] for row in rows]
+        vecs = self._embed_batch(texts)
+
+        # Build list of (id, content, tier_str, created_at, vec) for memories with valid embeddings
+        memories = []
+        for row, vec in zip(rows, vecs):
+            if vec is not None:
+                memories.append({
+                    "id": row[0],
+                    "content": row[1],
+                    "tier": self._decode_tier(row[2]),
+                    "created_at": row[3],
+                    "vec": vec,
+                })
+
+        if len(memories) < 2:
+            return {"groups": 0, "archived": 0, "dry_run": dry_run, "details": []}
+
+        # --- Step 3: Union-Find grouping by cosine similarity ---
+        n = len(memories)
+        # parent[i] = parent index in memories list
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]  # path compression
+                x = parent[x]
+            return x
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
+
+        # Compare all pairs
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = self._cosine_similarity(memories[i]["vec"], memories[j]["vec"])
+                if sim >= similarity_threshold:
+                    union(i, j)
+
+        # Collect groups (only groups with 2+ members)
+        from collections import defaultdict
+        groups_map: dict[int, list[int]] = defaultdict(list)
+        for i in range(n):
+            root = find(i)
+            groups_map[root].append(i)
+
+        groups = [indices for indices in groups_map.values() if len(indices) >= 2]
+
+        if not groups:
+            return {"groups": 0, "archived": 0, "dry_run": dry_run, "details": []}
+
+        # --- Step 4: For each group, decide what to keep and what to archive ---
+        total_archived = 0
+        details = []
+
+        now = time.time()
+
+        for group_indices in groups:
+            group_memories = [memories[i] for i in group_indices]
+
+            # Sort: longest content first; if tie, newest first
+            group_memories.sort(
+                key=lambda m: (len(m["content"]), m["created_at"]),
+                reverse=True,
+            )
+
+            kept = group_memories[0]
+            to_archive = group_memories[1:]
+            archived_ids = [m["id"] for m in to_archive]
+
+            if merge_fn is not None:
+                # Custom merge: create a new merged memory from all group members
+                merge_input = [
+                    {"id": m["id"], "content": m["content"], "tier": m["tier"], "created_at": m["created_at"]}
+                    for m in group_memories
+                ]
+                merged_content = merge_fn(merge_input)
+
+                if not dry_run:
+                    # Archive ALL members of the group (including the "kept" one)
+                    all_ids = [m["id"] for m in group_memories]
+                    for mid in all_ids:
+                        self.db.execute(
+                            "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
+                            (now, mid),
+                        )
+
+                    # Create new merged memory
+                    result = self.remember(
+                        content=merged_content,
+                        tier=kept["tier"],
+                        supersedes=kept["id"],
+                    )
+                    kept_id = result["id"]
+                    archived_ids = all_ids
+                else:
+                    kept_id = kept["id"]
+                    archived_ids = [m["id"] for m in group_memories]
+            else:
+                # Default: keep the longest, archive the rest
+                if not dry_run:
+                    for mid in archived_ids:
+                        self.db.execute(
+                            "UPDATE memories SET archived = 1, updated_at = ? WHERE id = ?",
+                            (now, mid),
+                        )
+
+                    # Set supersedes on the kept memory if it doesn't already have one
+                    existing_supersedes = self.db.execute(
+                        "SELECT supersedes FROM memories WHERE id = ?",
+                        (kept["id"],),
+                    ).fetchone()
+                    if existing_supersedes and existing_supersedes[0] is None:
+                        # Point supersedes to the first archived id (most info after kept)
+                        self.db.execute(
+                            "UPDATE memories SET supersedes = ? WHERE id = ?",
+                            (archived_ids[0], kept["id"]),
+                        )
+
+                kept_id = kept["id"]
+
+            total_archived += len(archived_ids) if merge_fn is not None and not dry_run else len(to_archive)
+
+            details.append({
+                "kept": kept_id,
+                "archived_ids": archived_ids if merge_fn is not None else [m["id"] for m in to_archive],
+                "contents_preview": [m["content"][:80] for m in group_memories],
+            })
+
+        if not dry_run:
+            self.db.commit()
+
+        return {
+            "groups": len(groups),
+            "archived": total_archived,
+            "dry_run": dry_run,
+            "details": details,
+        }
+
     def cleanup_working(self):
         """Archive expired working memories."""
         cutoff = time.time() - WORKING_TTL
@@ -1274,6 +2271,321 @@ class MemoryStore:
             (working_stored, cutoff),
         )
         self.db.commit()
+
+    # ================================================================
+    # TOOL 14: get_procedures(namespace)
+    # ================================================================
+    def get_procedures(self, namespace: Optional[str] = None) -> str:
+        """
+        Get all active procedural memories formatted for system prompt injection.
+
+        Returns a formatted string ready to prepend to an agent's system prompt:
+
+        ## Agent Rules (from memory)
+        - Rule 1 content here
+        - Rule 2 content here
+        ...
+
+        If no procedural memories exist, returns empty string.
+
+        Args:
+            namespace: Optional namespace filter
+        """
+        proc_stored = self._encode_tier("procedural")
+
+        where_parts = ["archived = 0", "tier = ?"]
+        params: list = [proc_stored]
+
+        if namespace is not None:
+            where_parts.append("(namespace = ? OR namespace LIKE ?)")
+            params.extend([namespace, namespace + "/%"])
+
+        where_clause = " AND ".join(where_parts)
+        rows = self.db.execute(
+            f"SELECT content FROM memories WHERE {where_clause} ORDER BY created_at ASC",
+            params,
+        ).fetchall()
+
+        if not rows:
+            return ""
+
+        lines = ["## Agent Rules (from memory)"]
+        for row in rows:
+            lines.append(f"- {row[0]}")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # TOOL 15: add_procedure(rule)
+    # ================================================================
+    def add_procedure(
+        self,
+        rule: str,
+        tags: list[str] = None,
+        namespace: str = "",
+    ) -> dict:
+        """
+        Add a behavioral rule (procedural memory).
+
+        Convenience wrapper around remember() with tier="procedural".
+        Procedural memories are never auto-expired or auto-compacted.
+
+        Args:
+            rule: The behavioral rule text (e.g., "Always respond in bullet points")
+            tags: Optional tags
+            namespace: Optional namespace
+        """
+        return self.remember(content=rule, tier="procedural", tags=tags, namespace=namespace)
+
+    # ================================================================
+    # Conversation Auto-Extraction (regex heuristics only, no LLM)
+    # ================================================================
+
+    @staticmethod
+    def _extract_facts(text: str) -> list[tuple[str, str, str]]:
+        """Extract "X is Y" / "X are Y" style facts. Returns (text, type, tier)."""
+        results = []
+        # "X is/are/was/were Y" — sentence-level
+        for m in re.finditer(
+            r'(?:^|\.\s+)([A-Z][^.]*?\s+(?:is|are|was|were)\s+[^.]+\.)',
+            text, re.MULTILINE
+        ):
+            val = m.group(1).strip()
+            if len(val) > 10 and len(val) < 500:
+                results.append((val, "facts", "learned"))
+        # key: value or key = value patterns
+        for m in re.finditer(r'(\w[\w\s]{1,30}?)\s*[:=]\s*(\S[^\n]{5,})', text):
+            key = m.group(1).strip()
+            value = m.group(2).strip()
+            full = f"{key}: {value}"
+            if len(full) > 10 and len(full) < 500:
+                results.append((full, "facts", "learned"))
+        return results
+
+    @staticmethod
+    def _extract_decisions(text: str) -> list[tuple[str, str, str]]:
+        """Extract decisions. Returns (text, type, tier)."""
+        results = []
+        patterns = [
+            r"(?:I|we|I've|we've)\s+decided\s+(?:to\s+)?([^.!]+[.!]?)",
+            r"(?:decision|decided|conclusion)\s*:\s*([^\n]+)",
+            r"let'?s\s+(?:go\s+with|use|do|try)\s+([^.!]+[.!]?)",
+            r"going\s+(?:to|with)\s+([^.!]+[.!]?)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                val = m.group(1).strip().rstrip(".")
+                if len(val) > 5 and len(val) < 500:
+                    # Reconstruct with context
+                    full_match = m.group(0).strip()
+                    results.append((full_match, "decisions", "episodic"))
+        return results
+
+    @staticmethod
+    def _extract_preferences(text: str) -> list[tuple[str, str, str]]:
+        """Extract preferences/rules. Returns (text, type, tier)."""
+        results = []
+        patterns = [
+            r"(?:always|never|must always|must never|should always|should never)\s+([^.!]+[.!]?)",
+            r"(?:I|we)\s+(?:prefer|like|want|need)\s+([^.!]+[.!]?)",
+            r"(?:don'?t|do not)\s+(?:ever\s+)?(?:use|do|like|want)\s+([^.!]+[.!]?)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                full_match = m.group(0).strip()
+                if len(full_match) > 5 and len(full_match) < 500:
+                    results.append((full_match, "preferences", "procedural"))
+        return results
+
+    @staticmethod
+    def _extract_todos(text: str) -> list[tuple[str, str, str]]:
+        """Extract action items. Returns (text, type, tier)."""
+        results = []
+        patterns = [
+            r"(?:TODO|FIXME|HACK|XXX)\s*:?\s*([^\n]+)",
+            r"(?:need to|needs to|should|must|have to|gotta)\s+([^.!]+[.!]?)",
+            r"(?:remember to|don'?t forget)\s+([^.!]+[.!]?)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                val = m.group(1).strip()
+                if len(val) > 3 and len(val) < 500:
+                    full_match = m.group(0).strip()
+                    results.append((full_match, "todos", "working"))
+        return results
+
+    @staticmethod
+    def _extract_config(text: str) -> list[tuple[str, str, str]]:
+        """Extract configuration values. Returns (text, type, tier)."""
+        results = []
+        # ENV_VAR=value
+        for m in re.finditer(r'([A-Z][A-Z0-9_]{2,})\s*=\s*(\S+)', text):
+            full = f"{m.group(1)}={m.group(2)}"
+            if len(full) < 500:
+                results.append((full, "config", "core"))
+        # "set X to Y" / "change X to Y"
+        for m in re.finditer(r'(?:set|change|update)\s+(\w+)\s+to\s+([^.!,]+)', text, re.IGNORECASE):
+            full = m.group(0).strip()
+            if len(full) > 5 and len(full) < 500:
+                results.append((full, "config", "core"))
+        # "port/host/url/endpoint/key/token/path is/:/= value"
+        for m in re.finditer(
+            r'(?:port|host|url|endpoint|key|token|path)\s*(?:is|:|=)\s*(\S+)',
+            text, re.IGNORECASE
+        ):
+            full = m.group(0).strip()
+            if len(full) > 5 and len(full) < 500:
+                results.append((full, "config", "core"))
+        return results
+
+    @staticmethod
+    def _extract_learnings(text: str) -> list[tuple[str, str, str]]:
+        """Extract learnings. Returns (text, type, tier)."""
+        results = []
+        patterns = [
+            r"(?:TIL|today I learned|learned that|turns out|found out|discovered)\s*:?\s*([^\n.!]+[.!]?)",
+            r"(?:the\s+(?:trick|solution|fix|answer|key)\s+(?:is|was))\s+([^.!]+[.!]?)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                val = m.group(1).strip()
+                if len(val) > 5 and len(val) < 500:
+                    full_match = m.group(0).strip()
+                    results.append((full_match, "learnings", "learned"))
+        return results
+
+    @staticmethod
+    def _extract_important(text: str) -> list[tuple[str, str, str]]:
+        """Extract important notes. Returns (text, type, tier)."""
+        results = []
+        # "important:/note:/NB:/critical:/warning:" patterns
+        for m in re.finditer(
+            r'(?:important|note|NB|critical|warning|caution|attention)\s*:\s*([^\n]+)',
+            text, re.IGNORECASE
+        ):
+            val = m.group(1).strip()
+            if len(val) > 5 and len(val) < 500:
+                full_match = m.group(0).strip()
+                results.append((full_match, "important", "core"))
+        return results
+
+    # Tier mapping for extraction types
+    _EXTRACTION_TIER_MAP = {
+        "facts": "learned",
+        "decisions": "episodic",
+        "preferences": "procedural",
+        "todos": "working",
+        "config": "core",
+        "learnings": "learned",
+        "important": "core",
+    }
+
+    def process_conversation(
+        self,
+        messages: list[dict],
+        namespace: str = "",
+        source: str = "conversation",
+    ) -> dict:
+        """
+        Automatically extract and store memories from a conversation history.
+
+        Scans messages for extractable patterns and stores them as appropriate memories.
+        Uses ONLY regex heuristics -- no LLM calls.
+
+        Args:
+            messages: List of {"role": "user"|"assistant", "content": "text"} dicts.
+                      Standard OpenAI/Anthropic message format.
+            namespace: Namespace to store extracted memories in
+            source: Source label (default "conversation")
+
+        Pattern categories extracted:
+        1. FACTS: "X is Y", "X are Y", "X = Y", "X: Y" patterns
+        2. DECISIONS: "I decided", "we decided", "decision:", "let's go with"
+        3. PREFERENCES: "always", "never", "prefer", "don't like", "I want"
+        4. TODOS: "TODO", "FIXME", "need to", "should", "must", "remember to"
+        5. CONFIG: "KEY=VALUE", "set X to Y", environment variables
+        6. LEARNINGS: "TIL", "learned that", "turns out", "found out", "discovered"
+        7. IMPORTANT: "important:", "note:", "NB:", "critical:", "warning:"
+
+        Returns:
+            {"extracted": int, "by_type": {"facts": N, "decisions": N, ...}, "memories": [ids]}
+        """
+        # Order matters: more specific extractors first so their tier/type wins
+        # when the same text matches multiple patterns (dedup by seen_texts)
+        extractors = [
+            self._extract_important,    # "important:", "note:", "warning:" → core
+            self._extract_config,       # ENV_VAR=value, "set X to Y" → core
+            self._extract_decisions,    # "I decided", "let's go with" → episodic
+            self._extract_learnings,    # "learned that", "turns out" → learned
+            self._extract_preferences,  # "always", "never", "prefer" → procedural
+            self._extract_todos,        # "TODO", "need to", "must" → working
+            self._extract_facts,        # "X is Y", "key: value" → learned (most generic)
+        ]
+
+        # Collect all extractions: (content, extraction_type, tier)
+        all_extractions: list[tuple[str, str, str]] = []
+        seen_texts: set[str] = set()  # deduplicate within this batch
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if not content or not isinstance(content, str):
+                continue
+
+            role = msg.get("role", "unknown")
+
+            for extractor in extractors:
+                hits = extractor(content)
+                for extracted_text, extraction_type, tier in hits:
+                    cleaned = extracted_text.strip()
+                    if not cleaned:
+                        continue
+                    # Deduplicate within this extraction run
+                    norm = cleaned.lower()
+                    if norm in seen_texts:
+                        continue
+                    seen_texts.add(norm)
+                    all_extractions.append((cleaned, extraction_type, tier))
+
+        if not all_extractions:
+            return {"extracted": 0, "by_type": {}, "memories": []}
+
+        # Build items for remember_batch
+        batch_items = []
+        for content_text, extraction_type, tier in all_extractions:
+            batch_items.append({
+                "content": content_text,
+                "tier": tier,
+                "tags": [extraction_type, "auto-extracted"],
+                "source": source,
+                "namespace": namespace,
+            })
+
+        # Store via remember_batch for efficiency
+        result = self.remember_batch(batch_items, namespace=namespace)
+
+        # Count by extraction type
+        by_type: dict[str, int] = {}
+        for _, extraction_type, _ in all_extractions:
+            by_type[extraction_type] = by_type.get(extraction_type, 0) + 1
+
+        # Retrieve the IDs of stored memories (newly inserted ones)
+        # We can approximate by fetching the most recent N memories tagged auto-extracted
+        memory_ids: list[int] = []
+        if result["imported"] > 0:
+            rows = self.db.execute(
+                """SELECT id FROM memories
+                   WHERE tags LIKE '%auto-extracted%'
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (result["imported"],),
+            ).fetchall()
+            memory_ids = [r[0] for r in rows]
+
+        return {
+            "extracted": len(all_extractions),
+            "by_type": by_type,
+            "memories": memory_ids,
+        }
 
     def close(self):
         self.db.close()

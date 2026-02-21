@@ -10,9 +10,17 @@ Every AI agent session starts from zero. Context windows compress, conversations
 
 - **Hybrid search**: FTS5 full-text keywords + vector semantic search, fused with adaptive ranking
 - **4 operational modes**: from zero dependencies (stdlib only) to best quality (12MB)
-- **MCP server**: 6 tools via stdio JSON-RPC — plug into any MCP-compatible agent
-- **Tiered storage**: core (permanent), learned (discovered), episodic (events), working (auto-expires)
-- **Multilingual**: Russian keywords via FTS5, English semantics via embeddings, mixed queries handled
+- **16 MCP tools**: recall, remember, save_state, compact, consolidate, entities, and more
+- **HTTP REST API**: 14 endpoints, zero-dependency server, CORS-ready
+- **5 memory tiers**: core, learned, episodic, working (auto-expires), procedural (behavioral rules)
+- **Namespaces**: multi-user, multi-agent memory isolation
+- **Temporal versioning**: fact evolution chains with supersedes tracking
+- **Entity extraction**: auto-extracts @mentions, URLs, IPs, env vars, money amounts
+- **Conversation extraction**: auto-extracts facts, decisions, TODOs from chat history
+- **Importance scoring**: auto-scores memories by tier, length, specificity, structure
+- **Memory consolidation**: finds and merges near-duplicate memories
+- **Recency boost**: newer memories rank higher with configurable decay
+- **Multilingual**: Russian keywords via FTS5, English semantics via embeddings
 - **Fast**: <1ms/query hybrid search, <5ms cold start, <0.2ms/chunk import
 
 ## Install
@@ -40,21 +48,47 @@ embed = get_embedding_model()
 store = MemoryStore("memory.db", embedding_dim=embed.dim)
 store.set_embed_fn(embed)
 
-# Store memories
-store.remember("Server costs $50/month, runs Ubuntu 24.04", tier="core")
-store.remember("Discovered that API returns 403 without auth header", tier="learned")
-store.remember("Deployed v2.1 to production at 15:30", tier="episodic")
+# Store memories with namespaces
+store.remember("Server costs $50/month", tier="core", namespace="infra")
+store.remember("API returns 403 without auth", tier="learned", namespace="api")
+store.remember("Deployed v2.1 at 15:30", tier="episodic")
 
-# Search — hybrid keyword + semantic
-results = store.recall("server costs")
-# → finds the memory even with "how much does hosting cost?"
+# Search — hybrid keyword + semantic, with recency boost
+results = store.recall("server costs", recency_weight=0.15)
+
+# Namespace isolation
+results = store.recall("server", namespace="infra")
 
 # Save working state before context compression
 store.save_state("Working on auth fix, step 3/5, blocked by CORS")
 
-# Import existing markdown files
+# Add behavioral rules (procedural memory)
+store.add_procedure("Always use HTTPS in production")
+store.add_procedure("Never expose debug endpoints")
+rules = store.get_procedures()  # → formatted for system prompt
+
+# Update facts with version chain
+store.update_memory(old_id=1, new_content="Server costs $75/month")
+history = store.history(memory_id=2)  # → trace fact evolution
+
+# Find related memories by entity
+related = store.related("10.0.0.1")  # → all memories mentioning this IP
+entities = store.entities(entity_type="ip")  # → list all known IPs
+
+# Auto-extract from conversations
+messages = [
+    {"role": "user", "content": "Set API_KEY to sk-abc123. Always validate input."},
+    {"role": "assistant", "content": "Noted. I decided to use pydantic for validation."},
+]
+result = store.process_conversation(messages, namespace="project")
+# → extracts config, preferences, decisions automatically
+
+# Maintenance
+store.compact(max_age_days=90)  # archive old low-value memories
+store.consolidate(similarity_threshold=0.85)  # merge near-duplicates
+
+# Import markdown files
 store.import_markdown("MEMORY.md", tier="core")
-store.import_markdown("2024-01-15.md", tier="episodic")
 ```
 
 ### CLI
@@ -64,23 +98,35 @@ store.import_markdown("2024-01-15.md", tier="episodic")
 agentmem init --db memory.db
 
 # Import markdown files
-agentmem import MEMORY.md --tier core
+agentmem import MEMORY.md --tier core -n my-agent
 agentmem import-dir ./daily-logs/ --tier episodic
 
-# Search
-agentmem search "deployment process" --limit 5
+# Search with namespace filter
+agentmem search "deployment process" --limit 5 -n infra
 
-# Stats
+# Manage procedures
+agentmem add-procedure "Always use markdown formatting"
+agentmem procedures
+
+# View entities and relations
+agentmem entities --type ip
+agentmem related 10.0.0.1
+
+# Maintenance
+agentmem compact --max-age-days 90 --dry-run
+agentmem consolidate --threshold 0.85
+
+# Process conversation
+agentmem process chat.json -n project
+
+# Stats and export
 agentmem stats
-
-# Export
 agentmem export --tier core
 ```
 
-### MCP Server
+### MCP Server (stdio)
 
 ```bash
-# Start MCP server (stdio transport)
 python -m agentmem --db memory.db
 ```
 
@@ -97,16 +143,131 @@ Add to your MCP client config:
 }
 ```
 
-**6 MCP tools:**
+### HTTP REST API
 
-| Tool | Description |
-|------|-------------|
-| `recall` | Hybrid keyword + semantic search |
-| `remember` | Store a new memory with tier and tags |
-| `save_state` | Emergency save before context compression |
-| `today` | Get all memories created today |
-| `forget` | Archive a memory (soft delete) |
-| `stats` | Memory statistics and health |
+```bash
+# Start HTTP server
+agentmem serve-http --port 8422
+
+# Or directly
+agentmem-http --port 8422 --db memory.db
+```
+
+```bash
+# Store a memory
+curl -X POST http://localhost:8422/remember \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Server IP is 10.0.0.1", "tier": "core", "namespace": "infra"}'
+
+# Search
+curl "http://localhost:8422/recall?query=server+IP&namespace=infra"
+
+# Health check
+curl http://localhost:8422/health
+```
+
+**16 MCP tools / 14 HTTP endpoints:**
+
+| Tool | HTTP | Description |
+|------|------|-------------|
+| `recall` | `GET /recall` | Hybrid keyword + semantic search |
+| `remember` | `POST /remember` | Store a new memory |
+| `save_state` | `POST /save_state` | Emergency save before context compression |
+| `today` | `GET /today` | Get all memories from today |
+| `forget` | `POST /forget` | Archive a memory (soft delete) |
+| `unarchive` | `POST /unarchive` | Restore an archived memory |
+| `stats` | `GET /stats` | Memory statistics and health |
+| `compact` | `POST /compact` | Archive low-value memories |
+| `consolidate` | `POST /consolidate` | Merge near-duplicate memories |
+| `update_memory` | `POST /update_memory` | Replace a memory with version chain |
+| `history` | `GET /history` | Trace fact version history |
+| `related` | `GET /related` | Find memories by entity |
+| `entities` | `GET /entities` | List all extracted entities |
+| `get_procedures` | — | Get behavioral rules for system prompt |
+| `add_procedure` | — | Add a behavioral rule |
+| `process_conversation` | — | Auto-extract from chat history |
+
+## Memory Tiers
+
+| Tier | Purpose | Auto-compacted | Example |
+|------|---------|---------------|---------|
+| `core` | Permanent facts | Never | "Server IP is 10.0.0.1" |
+| `procedural` | Behavioral rules | Never | "Always use HTTPS" |
+| `learned` | Discovered knowledge | After 90 days | "API returns 403 without auth" |
+| `episodic` | Events | After 90 days | "Deployed v2.1 at 15:30" |
+| `working` | Current task state | After 24 hours | "Working on step 3/5" |
+
+## Namespaces
+
+Isolate memories per user, agent, or project:
+
+```python
+# Store in namespaces
+store.remember("Alice's API key", namespace="user/alice")
+store.remember("Bob's config", namespace="user/bob")
+store.remember("Shared fact", namespace="team")
+
+# Search within namespace (prefix matching)
+store.recall("API", namespace="user/alice")  # only Alice's memories
+store.recall("API", namespace="user")  # Alice + Bob (prefix match)
+store.recall("API")  # everything
+```
+
+## Temporal Versioning
+
+Track how facts evolve over time:
+
+```python
+# Initial fact
+r1 = store.remember("Server costs $50/month", tier="core")
+
+# Fact changes — old version archived, linked via supersedes
+r2 = store.update_memory(r1["id"], "Server costs $75/month")
+
+# Trace the history
+history = store.history(r2["id"])
+# → [{"id": 2, "content": "...$75..."}, {"id": 1, "content": "...$50..."}]
+```
+
+## Entity Extraction
+
+Automatic regex-based NER on every `remember()` call:
+
+| Type | Pattern | Example |
+|------|---------|---------|
+| `mention` | `@username` | @alice |
+| `url` | `https://...` | https://api.example.com |
+| `ip` | `N.N.N.N` | 10.0.0.1 |
+| `port` | `:NNNN` | :8080 |
+| `email` | `user@domain` | admin@example.com |
+| `env_var` | `ALL_CAPS` | OPENAI_API_KEY |
+| `money` | `$NNN` | $50 |
+| `path` | `/unix/path` | /etc/nginx/conf.d |
+| `hashtag` | `#tag` | #deployment |
+
+```python
+# Find all memories mentioning an entity
+store.related("10.0.0.1")
+store.related("@alice", entity_type="mention")
+
+# List all known entities
+store.entities()  # sorted by memory count
+store.entities(entity_type="ip")
+```
+
+## Conversation Auto-Extraction
+
+Auto-extract memories from chat history (regex-only, no LLM):
+
+```python
+messages = [
+    {"role": "user", "content": "Set DATABASE_URL to postgres://localhost/mydb"},
+    {"role": "assistant", "content": "I decided to use connection pooling. Important: max 20 connections."},
+    {"role": "user", "content": "Always validate input. TODO: add rate limiting."},
+]
+result = store.process_conversation(messages)
+# Extracts: config→core, decisions→episodic, preferences→procedural, todos→working, important→core
+```
 
 ## Operational Modes
 
@@ -121,104 +282,48 @@ agentmem automatically selects the best available mode:
 
 *\*With lazy loading — model2vec loads on first query, not on init*
 
-### HashEmbedding (zero dependencies)
-
-Pure Python SimHash-style embeddings using MD5 random projection. No pip packages needed.
-
-- 128-dimensional vectors from word unigrams + char n-grams
-- ~0.05ms per embedding
-- ~70-80% quality of transformer models for entity/keyword retrieval
-- Handles any UTF-8 text (Russian, CJK, etc.)
-
-### model2vec (best quality)
-
-[model2vec](https://github.com/MinishLab/model2vec) potion-base-8M: static embeddings distilled from transformers.
-
-- 256-dimensional vectors
-- 8MB model, numpy-only (no PyTorch)
-- 30,000+ sentences/sec on CPU
-- Best semantic understanding
-
 ## Architecture
 
 ```
-┌──────────────────────────────────────┐
-│            MemoryStore               │
-│  ┌──────────┐  ┌──────────────────┐  │
-│  │  FTS5    │  │  Vector Index    │  │
-│  │ keywords │  │ (sqlite-vec or   │  │
-│  │  + BM25  │  │  pure Python)    │  │
-│  └─────┬────┘  └────────┬─────────┘  │
-│        └───────┬────────┘            │
-│         Adaptive Hybrid Scorer       │
-│     (classifies query → weights)     │
-│  ┌──────────────────────────────────┐│
-│  │         SQLite + WAL             ││
-│  │  memories │ memories_fts │ vecs  ││
-│  └──────────────────────────────────┘│
-└──────────────────────────────────────┘
-         One file: memory.db
-```
-
-**Hybrid search pipeline:**
-1. Query classifier detects type: keyword-heavy, semantic-heavy, or mixed
-2. FTS5 runs phrase match + prefix match + individual terms (with stop-word filtering)
-3. Vector search runs cosine similarity (sqlite-vec KNN or pure Python brute-force)
-4. Results merged with adaptive weights based on query type
-5. Deduplicated and ranked by fused score
-
-## Smart Features
-
-### Adaptive Query Classification
-```python
-# Keyword query → FTS5 weighted higher
-store.recall("API endpoint port 8420")
-
-# Semantic query → vector search weighted higher
-store.recall("how to restart after a crash")
-
-# Mixed → balanced fusion
-store.recall("Telegram bot growth strategies")
-```
-
-### Smart Markdown Chunking
-Paragraph-level splitting with bullet-point awareness. A 200-line MEMORY.md becomes ~64 searchable chunks (avg ~250 chars) instead of ~10 coarse blocks.
-
-### Deduplication
-Content-hash based. Re-importing the same file is a no-op — only new/changed chunks are added.
-
-### Int8 Quantization
-Optional 4x storage reduction with ~98% recall quality:
-```python
-store = MemoryStore("memory.db", embedding_dim=128, quantize=True)
-```
-
-## Benchmarks
-
-Tested on real agent memory data (MEMORY.md + daily logs, ~64 chunks):
-
-```
-Operation          Time
-─────────────────────────
-Cold start         3-5 ms
-Import (per chunk) 0.15 ms
-Hybrid query       0.8-1.8 ms
-FTS5-only query    0.2 ms
-Vector-only query  0.1-0.5 ms
+┌──────────────────────────────────────────────┐
+│              MemoryStore                      │
+│  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
+│  │  FTS5    │  │  Vector  │  │  Entity    │  │
+│  │ keywords │  │  Index   │  │  Index     │  │
+│  │ + BM25   │  │ cosine   │  │  regex NER │  │
+│  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
+│       └──────┬───────┘              │         │
+│    Adaptive Hybrid Scorer           │         │
+│  (query classify + recency +        │         │
+│   importance boost)                 │         │
+│  ┌──────────────────────────────────┴───────┐ │
+│  │            SQLite + WAL                  │ │
+│  │  memories │ memories_fts │ vecs │ entities│ │
+│  └──────────────────────────────────────────┘ │
+│            One file: memory.db                │
+└───────────────────────────────────────────────┘
 ```
 
 ## Comparison
 
-| Feature | agentmem | ChromaDB | LanceDB | mem0 |
-|---------|----------|----------|---------|------|
-| Install size | 0-12 MB | 400+ MB | 100+ MB | 500+ MB |
-| Cold start | 3-5 ms | seconds | seconds | seconds |
-| PyTorch required | No | Yes | No | Yes |
-| Cloud required | No | No | No | Yes (default) |
-| Zero-dep mode | Yes | No | No | No |
-| Keyword search | FTS5 (BM25) | No | No | No |
-| MCP server | Built-in | No | No | No |
-| Single file DB | Yes | No | Yes | No |
+| Feature | agentmem | ChromaDB | LanceDB | mem0 | Zep |
+|---------|----------|----------|---------|------|-----|
+| Install size | 0-12 MB | 400+ MB | 100+ MB | 500+ MB | Cloud |
+| Cold start | 3-5 ms | seconds | seconds | seconds | N/A |
+| PyTorch required | No | Yes | No | Yes | N/A |
+| Cloud required | No | No | No | Yes | Yes |
+| Zero-dep mode | Yes | No | No | No | No |
+| Keyword search | FTS5 (BM25) | No | No | No | Yes |
+| MCP server | 16 tools | No | No | Yes | No |
+| HTTP API | Built-in | Yes | No | Yes | Yes |
+| Single file DB | Yes | No | Yes | No | No |
+| Namespaces | Yes | Yes | Yes | Yes | Yes |
+| Temporal versioning | Yes | No | Yes | No | Yes |
+| Entity extraction | Auto (regex) | No | No | No | No |
+| Procedural memory | Yes | No | No | No | No |
+| Importance scoring | Auto | No | No | No | No |
+| Conversation extraction | Auto (regex) | No | No | Yes (LLM) | Yes (LLM) |
+| Memory consolidation | Yes | No | No | Yes (LLM) | No |
 
 ## License
 

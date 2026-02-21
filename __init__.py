@@ -24,5 +24,5 @@ Usage:
 from .core import MemoryStore, TIERS
 from .embeddings import get_embedding_model
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["MemoryStore", "get_embedding_model", "TIERS"]
