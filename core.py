@@ -1547,6 +1547,30 @@ class MemoryStore:
         "расскажи", "покажи",
     })
 
+    def _maybe_translate(self, query: str) -> str:
+        """
+        Detect non-ASCII-heavy queries and translate to English.
+
+        Uses deep-translator (GoogleTranslator) if available.
+        Falls back to original query if translation fails or package not installed.
+        """
+        # Quick heuristic: if >50% of alpha chars are non-ASCII, likely non-English
+        alpha_chars = [c for c in query if c.isalpha()]
+        if not alpha_chars:
+            return query
+        non_ascii = sum(1 for c in alpha_chars if ord(c) > 127)
+        if non_ascii / len(alpha_chars) < 0.5:
+            return query  # Looks English enough
+
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source='auto', target='en').translate(query)
+            if translated:
+                return translated
+        except Exception:
+            pass
+        return query
+
     def _classify_query(self, query: str) -> tuple[float, float]:
         """
         Analyse a query string and return (fts_weight, vec_weight) for hybrid scoring.
@@ -1633,6 +1657,7 @@ class MemoryStore:
         decay_rate: float | None = None,
         namespace: str | None = None,
         current_only: bool = True,
+        auto_translate: bool = False,
     ) -> list[RecallResult]:
         """
         Hybrid search: FTS5 (keywords) + vector search (semantics) → rerank.
@@ -1652,9 +1677,15 @@ class MemoryStore:
             current_only: If True (default), exclude memories that have been superseded
                           (i.e., memories whose id appears in another memory's supersedes column).
                           This ensures only the latest version of each fact is returned.
+            auto_translate: If True, detect non-English queries and translate to English
+                           before searching. Requires deep-translator package. Useful when
+                           memories are stored in English but queries come in other languages.
 
         Returns list of {"id", "content", "tier", "source", "score", "method"}
         """
+        # Auto-translate non-English queries if requested
+        if auto_translate and query:
+            query = self._maybe_translate(query)
         # Use instance defaults if not overridden per-call
         if recency_weight is None:
             recency_weight = self.recency_weight
@@ -2069,7 +2100,9 @@ class MemoryStore:
                     continue
 
             # Convert cosine distance (0=identical, 2=opposite) to score (1=identical, 0=opposite)
-            distance = distance_map[rowid]
+            distance = distance_map.get(rowid)
+            if distance is None:
+                continue
             score = max(0.0, 1.0 - distance)
             results.append({
                 "id": meta[0],
