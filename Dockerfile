@@ -2,8 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml README.md LICENSE ./
-COPY agentmem/ ./agentmem/
+COPY . .
 
 RUN pip install --no-cache-dir ".[all]"
 
